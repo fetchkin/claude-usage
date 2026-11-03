@@ -31,6 +31,39 @@ DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usag
 # would misfire there because the Marketplace publish lags the GitHub release).
 SURFACE = "web"
 
+# Fetchkin fork: dated "event markers" (e.g. a skill install) drawn on the
+# per-day charts so a usage change can be read against what changed. The repo's
+# events.json ships the shared list; ~/.claude/usage-events.json (optional) adds
+# local ones, and an entry there with the same date + label replaces the repo one.
+EVENTS_PATHS = [
+    Path(__file__).resolve().parent / "events.json",
+    Path.home() / ".claude" / "usage-events.json",
+]
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def load_events(paths=None):
+    merged = {}
+    for p in (EVENTS_PATHS if paths is None else paths):
+        try:
+            items = json.loads(Path(p).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(items, dict):
+            items = items.get("events", [])
+        if not isinstance(items, list):
+            continue
+        for e in items:
+            if not isinstance(e, dict):
+                continue
+            date = str(e.get("date", ""))
+            label = str(e.get("label", "")).strip()
+            if not _DATE_RE.match(date) or not label:
+                continue
+            merged[(date, label)] = {"date": date, "label": label,
+                                     "detail": str(e.get("detail", "") or "")}
+    return sorted(merged.values(), key=lambda e: (e["date"], e["label"]))
+
 
 def get_dashboard_data(db_path=DB_PATH):
     if not db_path.exists():
@@ -236,7 +269,8 @@ def get_dashboard_data(db_path=DB_PATH):
         "sessions_all":    sessions_all,
         "subagent_by_type": subagent_by_type,
         "top_dispatches":  top_dispatches,
-        "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "events":          load_events(),
+        "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
@@ -369,6 +403,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .chart-header h2 { margin-bottom: 0; }
   .chart-header-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .chart-day-count { font-size: 11px; color: var(--muted); }
+  .event-compare { margin-top: 10px; font-size: 12px; color: var(--text); line-height: 1.6; }
+  .event-compare .ev-label { font-weight: 600; }
+  .event-compare .ev-muted { color: var(--axis); }
+  .event-compare .ev-down { color: var(--green); }
+  .event-compare .ev-up { color: var(--red); }
   .tz-group { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
   .tz-btn { padding: 3px 10px; background: transparent; border: none; border-right: 1px solid var(--border); color: var(--muted); font-size: 11px; cursor: pointer; transition: background 0.15s, color 0.15s; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
   .tz-btn:last-child { border-right: none; }
@@ -696,6 +735,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="chart-card wide" id="sec-daily" data-card="daily">
       <h2><span class="card-caret">&#9656;</span><span id="daily-chart-title">Daily Token Usage</span></h2>
       <div class="chart-wrap tall"><canvas id="chart-daily"></canvas></div>
+      <div class="event-compare" id="daily-events" hidden></div>
     </div>
     <div class="chart-card wide" id="sec-hourly" data-card="hourly">
       <div class="chart-header">
@@ -1676,11 +1716,107 @@ function renderHourlyChart(agg) {
   });
 }
 
+// ── Event markers (Fetchkin fork) ─────────────────────────────────────────
+// Events from /api/data (events.json + ~/.claude/usage-events.json) are drawn as
+// a dashed vertical line + small label on per-day charts whose x labels are
+// YYYY-MM-DD. Only dates inside the chart's visible labels get a marker; a date
+// with no bar of its own sits between its neighbours. Colours come from C, so
+// the marker follows the light/dark theme on re-render.
+function eventsInLabels(labels) {
+  const evs = (rawData && rawData.events) || [];
+  if (!labels.length) return [];
+  return evs.filter(e => e.date >= labels[0] && e.date <= labels[labels.length - 1]);
+}
+const eventMarkerPlugin = {
+  id: 'eventMarkers',
+  afterDatasetsDraw(chart) {
+    const labels = chart.data.labels || [];
+    const evs = eventsInLabels(labels);
+    if (!evs.length) return;
+    const xs = chart.scales.x, area = chart.chartArea, g = chart.ctx;
+    g.save();
+    let lastLabelRight = -Infinity, row = 0;
+    for (const e of evs) {
+      const i = labels.findIndex(l => l >= e.date);
+      if (i < 0) continue;
+      const x = labels[i] === e.date || i === 0
+        ? xs.getPixelForValue(i)
+        : (xs.getPixelForValue(i - 1) + xs.getPixelForValue(i)) / 2;
+      g.strokeStyle = C.text; g.globalAlpha = 0.75; g.lineWidth = 1.5; g.setLineDash([5, 4]);
+      g.beginPath(); g.moveTo(x, area.top); g.lineTo(x, area.bottom); g.stroke();
+      g.setLineDash([]); g.globalAlpha = 1;
+      g.font = '600 11px ' + (Chart.defaults.font.family || 'sans-serif');
+      const w = g.measureText(e.label).width + 10, h = 18;
+      // Keep the label inside the plot; flip left of the line near the right edge
+      // and drop a row when two labels would overlap.
+      let lx = x + 4 + w > area.right ? x - 4 - w : x + 4;
+      row = lx < lastLabelRight + 4 ? row + 1 : 0;
+      const ly = area.top + 4 + row * (h + 4);
+      g.fillStyle = C.card; g.strokeStyle = C.border; g.lineWidth = 1;
+      g.beginPath(); g.rect(lx, ly, w, h); g.fill(); g.stroke();
+      g.fillStyle = C.text; g.textBaseline = 'middle'; g.textAlign = 'left';
+      g.fillText(e.label, lx + 5, ly + h / 2);
+      lastLabelRight = lx + w;
+    }
+    g.restore();
+  },
+};
+
+// Before/after line under the daily chart: the 7 days before each visible
+// event vs the days since it (event day through today). Tokens per turn is the
+// headline because how much we use varies day to day; per-day cost averages
+// completed days only (today alone if none are complete yet).
+function eventWindowStats(fromISO, toISO, completedBeforeISO) {
+  let tokens = 0, turns = 0, cost = 0, costDone = 0;
+  const days = new Set(), doneDays = new Set();
+  for (const r of rawData.daily_by_model) {
+    if (!selectedModels.has(r.model) || r.day < fromISO || r.day > toISO) continue;
+    const c = calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation);
+    tokens += r.input + r.output + r.cache_read + r.cache_creation;
+    turns += r.turns; cost += c;
+    if (!completedBeforeISO || r.day < completedBeforeISO) costDone += c;
+  }
+  return { tokens, turns, cost, costDone, perTurn: turns ? tokens / turns : 0 };
+}
+function renderEventCompare(labels) {
+  const el = document.getElementById('daily-events');
+  const evs = eventsInLabels(labels);
+  if (!evs.length) { el.hidden = true; el.innerHTML = ''; return; }
+  const iso = localISODate, today = iso(new Date());
+  const pctChange = (a, b) => {
+    if (!b) return '';
+    const p = (a - b) / b * 100;
+    const cls = p < 0 ? 'ev-down' : 'ev-up';
+    return ` <span class="${cls}">(${p > 0 ? '+' : ''}${p.toFixed(0)}%)</span>`;
+  };
+  el.innerHTML = evs.map(e => {
+    const d0 = parseLocalDate(e.date);
+    const before = eventWindowStats(iso(addDays(d0, -7)), iso(addDays(d0, -1)), null);
+    const after = eventWindowStats(e.date, today, today);
+    const spanDays = Math.max(1, Math.round((parseLocalDate(today) - d0) / 86400000) + 1);
+    const fullDays = spanDays - 1;  // event day .. yesterday
+    const afterPerDay = fullDays >= 1 ? after.costDone / fullDays : after.cost;
+    const sinceLabel = d0.getDate() + ' ' + d0.toLocaleDateString('en-GB', { month: 'short' });
+    const verdict = fullDays < 2
+      ? ` <span class="ev-muted">· too early to tell (${fullDays} full day${fullDays === 1 ? '' : 's'} after)</span>`
+      : '';
+    return `<div title="${esc(e.detail || '')}"><span class="ev-label">${esc(e.label)}</span> `
+      + `<span class="ev-muted">${esc(e.date)}</span> — `
+      + `tokens/turn ${fmt(before.perTurn)} → ${fmt(after.perTurn)}${pctChange(after.perTurn, before.perTurn)}, `
+      + `est. cost/day ${fmtCostBig(before.cost / 7)} → ${fmtCostBig(afterPerDay)}${pctChange(afterPerDay, before.cost / 7)} `
+      + `<span class="ev-muted">· 7 days before vs since ${esc(sinceLabel)} (${spanDays} day${spanDays === 1 ? '' : 's'})</span>`
+      + verdict + `</div>`;
+  }).join('');
+  el.hidden = false;
+}
+
 function renderDailyChart(daily) {
   const ctx = document.getElementById('chart-daily').getContext('2d');
   if (charts.daily) charts.daily.destroy();
+  renderEventCompare(daily.map(d => d.day));
   charts.daily = new Chart(ctx, {
     type: 'bar',
+    plugins: [eventMarkerPlugin],
     data: {
       labels: daily.map(d => d.day),
       datasets: [
