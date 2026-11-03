@@ -4,13 +4,21 @@ dashboard.py - Local web dashboard served on localhost:8080.
 
 import json
 import os
+import re
 import sqlite3
+import threading
+import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from datetime import datetime
 
 from scanner import VERSION, init_db
+
+try:  # Fetchkin fork: per-chat attribution for OpenClaw. Not bundled in the .vsix.
+    import openclaw_attrib
+except ImportError:  # pragma: no cover
+    openclaw_attrib = None
 
 DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usage.db"))
 
@@ -253,8 +261,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --red: #C74E39;
     --raised: #2E2F31;  /* hover / raised surfaces — top of the elevation ladder */
     --selected: #262626;  /* selected chips / tabs (neutral, not accent) */
+    --axis: #6F6F70;     /* chart axis / legend text (a touch lighter than --muted) */
     --jump-h: 45px;  /* sticky jump-bar height; JS keeps it in sync for scroll offsets */
   }
+  /* Light theme (header toggle; "auto" follows the OS). Charts read these vars
+     on render via applyThemeColors(), so they repaint with the page. */
+  :root[data-theme="light"] {
+    --bg: #F6F5F2;
+    --card: #FFFFFF;
+    --border: #E2E0DB;
+    --text: #2A2A2B;
+    --muted: #85827E;
+    --accent: #C4623F;
+    --blue: #2F7EA3;
+    --green: #2E8A55;
+    --red: #B8432F;
+    --raised: #EFEDE8;
+    --selected: #E7E5E0;
+    --axis: #6B6865;
+  }
+  :root[data-theme="light"] * { scrollbar-color: #C9C6C0 #F0EEEA; }
+  :root[data-theme="light"] ::-webkit-scrollbar-track,
+  :root[data-theme="light"] ::-webkit-scrollbar-corner { background: #F0EEEA; }
+  :root[data-theme="light"] ::-webkit-scrollbar-thumb { background-color: #C9C6C0; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
 
@@ -433,7 +462,70 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .table-card.collapsed .section-header > *:not(.section-title) { display: none; }
 
   @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } .chart-card.wide { grid-column: 1; } }
+
+  .header-actions { display: flex; align-items: center; gap: 8px; }
+  #theme-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; margin-top: 4px; white-space: nowrap; }
+  #theme-btn:hover { color: var(--text); border-color: var(--accent); }
+
+  /* Cost by Chat (OpenClaw attribution) */
+  .chat-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .chat-custom { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  .chat-custom[hidden] { display: none; }
+  .chat-custom input { padding: 3px 6px; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; color-scheme: dark; }
+  :root[data-theme="light"] .chat-custom input { color-scheme: light; }
+  .chat-custom input:focus { border-color: var(--accent); outline: none; }
+  .chat-live { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block; }
+  .chat-live.stale .live-dot { background: var(--muted); }
+  .chat-live.pulse .live-dot { animation: livepulse 0.9s ease-out; }
+  @keyframes livepulse { 0% { box-shadow: 0 0 0 0 rgba(116,201,145,0.7); } 100% { box-shadow: 0 0 0 7px rgba(116,201,145,0); } }
+  @media (prefers-reduced-motion: reduce) { .chat-live.pulse .live-dot { animation: none; } }
+  .chat-grid { display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); gap: 24px; align-items: start; }
+  .chat-totals { display: flex; gap: 24px; margin-bottom: 12px; }
+  .chat-totals .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .chat-totals .value { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .chat-totals .value.cost-total { color: var(--green); }
+  .chart-wrap.chat-donut { height: 240px; }
+  .chat-coverage { margin-top: 12px; font-size: 12px; color: var(--muted); line-height: 1.6; }
+  .chat-coverage strong { color: var(--text); font-weight: 600; }
+  .chat-table-col { overflow-x: auto; min-width: 0; }
+  .chat-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 8px; vertical-align: middle; flex-shrink: 0; }
+  .chat-name { display: inline-flex; align-items: center; min-width: 160px; }
+  .chat-kind { white-space: nowrap; }
+  .chat-kind { margin-left: 8px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+  .share-cell { min-width: 120px; }
+  #sec-by-chat .tz-btn.active { background: var(--accent); color: #fff; }
+  .share-bar { height: 6px; border-radius: 3px; background: var(--raised); margin-top: 4px; overflow: hidden; }
+  .share-bar > span { display: block; height: 100%; border-radius: 3px; }
+  #chat-body td { font-variant-numeric: tabular-nums; }
+  .chat-empty { color: var(--muted); padding: 24px 12px; text-align: center; }
+  @media (max-width: 768px) {
+    .chat-grid { grid-template-columns: 1fr; }
+    .chat-live { margin-left: 0; }
+    /* Phone: keep chat, share, cost; the token split is in the CSV. */
+    #sec-by-chat th:nth-child(n+4), #sec-by-chat td:nth-child(n+4) { display: none; }
+    #sec-by-chat .chat-kind { display: none; }
+    #sec-by-chat .share-cell { min-width: 64px; }
+    #sec-by-chat { padding: 14px; }
+    .container { padding: 12px; }  /* 2 stat cards (2x160px + gap) fit a 390px phone */
+    #sec-by-chat td:first-child { max-width: 150px; }
+    .chat-name { min-width: 0; }
+    #sec-by-chat td, #sec-by-chat th { padding: 8px 6px; }
+    header { flex-wrap: wrap; gap: 8px; }
+    header .meta { margin-right: 0; }
+  }
 </style>
+<script>
+  // Apply the saved theme before first paint (no dark->light flash).
+  (function () {
+    var pref = 'auto';
+    try { pref = localStorage.getItem('cu_theme') || 'auto'; } catch (e) {}
+    var forced = new URLSearchParams(location.search).get('theme');  // ?theme=light|dark (screenshots, links)
+    if (forced === 'light' || forced === 'dark') pref = forced;
+    var light = pref === 'light' || (pref === 'auto' && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches);
+    document.documentElement.dataset.theme = light ? 'light' : 'dark';
+  })();
+</script>
 </head>
 <body>
 <header>
@@ -441,8 +533,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <span class="header-icon" role="img" aria-label="Claude Usage"></span>
     <h1>Claude Code Usage</h1>
   </div>
-  <div class="meta" id="meta">Loading...</div>
-  <button id="rescan-btn" onclick="triggerRescan()" title="Scan for new usage since the last update. Adds new turns without affecting existing history.">&#x21bb; Rescan</button>
+  <div class="header-actions">
+    <div class="meta" id="meta">Loading...</div>
+    <button id="theme-btn" onclick="cycleTheme()" title="Theme: auto follows your OS setting">Theme: Auto</button>
+    <button id="rescan-btn" onclick="triggerRescan()" title="Scan for new usage since the last update. Adds new turns without affecting existing history.">&#x21bb; Rescan</button>
+  </div>
 </header>
 
 <div id="filter-bar">
@@ -478,6 +573,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <nav id="jump-bar" aria-label="Jump to section">
   <button class="jump-link" data-target="stats-row">Overview</button>
+  <button class="jump-link" data-target="sec-by-chat">By Chat</button>
   <div class="jump-menu">
     <button type="button" class="jump-trigger" aria-haspopup="true" aria-expanded="false">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M8 17v-4"/><path d="M13 17V8"/><path d="M18 17v-7"/></svg>
@@ -508,6 +604,53 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <div class="container">
   <div class="stats-row" id="stats-row"></div>
+  <div class="table-card" id="sec-by-chat" data-card="by-chat">
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Cost by Chat <span class="info-icon" tabindex="0" role="img" aria-label="About this section" title="Which OpenClaw chat ran each Claude session: Slack channels (threads included), the main DM, and scheduled automations. Subagent workers count toward the chat that spawned them. Has its own date range; the Models filter above still applies. Refreshes every 30s."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportChatCSV()" title="Export the per-chat breakdown to CSV">&#x2913; CSV</button></div>
+    <div class="chat-controls">
+      <div class="tz-group" id="chat-presets" role="group" aria-label="Chat date range">
+        <button class="tz-btn" data-preset="today" onclick="setChatPreset('today')">Today</button>
+        <button class="tz-btn" data-preset="7d" onclick="setChatPreset('7d')">7 days</button>
+        <button class="tz-btn" data-preset="30d" onclick="setChatPreset('30d')">30 days</button>
+        <button class="tz-btn" data-preset="custom" onclick="setChatPreset('custom')">Custom</button>
+      </div>
+      <div class="chat-custom" id="chat-custom" hidden>
+        <input type="date" id="chat-from" aria-label="From date" onchange="onChatCustomChange()">
+        <span>&ndash;</span>
+        <input type="date" id="chat-to" aria-label="To date" onchange="onChatCustomChange()">
+      </div>
+      <div class="tz-group" id="chat-basis" role="group" aria-label="Share by">
+        <button class="tz-btn" data-basis="cost" onclick="setChatBasis('cost')">Cost</button>
+        <button class="tz-btn" data-basis="tokens" onclick="setChatBasis('tokens')">Tokens</button>
+      </div>
+      <span class="chat-live stale" id="chat-live" title="Polls every 30s and picks up new transcripts"><span class="live-dot"></span><span id="chat-live-text">Loading&hellip;</span></span>
+    </div>
+    <div class="chat-grid">
+      <div>
+        <div class="chat-totals">
+          <div><div class="label">Est. cost</div><div class="value cost-total" id="chat-total-cost">&mdash;</div></div>
+          <div><div class="label">Tokens</div><div class="value" id="chat-total-tokens">&mdash;</div></div>
+        </div>
+        <div class="chart-wrap chat-donut"><canvas id="chart-chat" aria-label="Share by chat"></canvas></div>
+        <div class="chat-coverage" id="chat-coverage"></div>
+      </div>
+      <div class="chat-table-col">
+        <table>
+          <thead><tr>
+            <th>Chat</th>
+            <th class="sortable" onclick="setChatSort('share')">Share <span class="sort-icon" id="csort-share"></span></th>
+            <th class="sortable" onclick="setChatSort('cost')">Est. Cost <span class="sort-icon" id="csort-cost"></span></th>
+            <th class="sortable" onclick="setChatSort('tokens')">Tokens <span class="sort-icon" id="csort-tokens"></span></th>
+            <th class="sortable" onclick="setChatSort('input')">Input <span class="sort-icon" id="csort-input"></span></th>
+            <th class="sortable" onclick="setChatSort('output')">Output <span class="sort-icon" id="csort-output"></span></th>
+            <th class="sortable" onclick="setChatSort('cache_read')">Cache Read <span class="sort-icon" id="csort-cache_read"></span></th>
+            <th class="sortable" onclick="setChatSort('cache_creation')">Cache Write <span class="sort-icon" id="csort-cache_creation"></span></th>
+            <th class="sortable" onclick="setChatSort('sessions')">Sessions <span class="sort-icon" id="csort-sessions"></span></th>
+          </tr></thead>
+          <tbody id="chat-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
   <div class="charts-grid">
     <div class="chart-card wide" id="sec-daily" data-card="daily">
       <h2><span class="card-caret">&#9656;</span><span id="daily-chart-title">Daily Token Usage</span></h2>
@@ -852,7 +995,51 @@ function fmtDuration(ms) {
 // Tooltip color swatches: solid fill, no border (Chart.js's default draws a
 // bordered box that looked offset/inconsistent). Lines use their solid stroke
 // color instead of the translucent area fill.
-Chart.defaults.color = C.axis;
+// Pull the active theme's CSS variables into C so charts match the page in both
+// dark and light themes. Charts are rebuilt on every render, so re-rendering
+// after a theme switch is enough to repaint them.
+function applyThemeColors() {
+  const cs = getComputedStyle(document.documentElement);
+  const v = (name, fallback) => (cs.getPropertyValue(name) || '').trim() || fallback;
+  C.text = v('--text', C.text); C.muted = v('--muted', C.muted); C.axis = v('--axis', C.axis);
+  C.border = v('--border', C.border); C.card = v('--card', C.card);
+  C.blue = v('--blue', C.blue); C.green = v('--green', C.green); C.red = v('--red', C.red);
+  C.accent = v('--accent', C.accent);
+  Chart.defaults.color = C.axis;
+}
+applyThemeColors();
+
+const THEME_KEY = 'cu_theme';
+const THEME_ORDER = ['auto', 'light', 'dark'];
+function themePref() {
+  const forced = new URLSearchParams(window.location.search).get('theme');
+  if (forced === 'light' || forced === 'dark') return forced;
+  try { const p = localStorage.getItem(THEME_KEY); return THEME_ORDER.includes(p) ? p : 'auto'; } catch (e) { return 'auto'; }
+}
+function resolveTheme(pref) {
+  if (pref === 'light' || pref === 'dark') return pref;
+  return window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+}
+function applyTheme() {
+  const pref = themePref();
+  document.documentElement.dataset.theme = resolveTheme(pref);
+  const btn = document.getElementById('theme-btn');
+  if (btn) btn.textContent = 'Theme: ' + pref.charAt(0).toUpperCase() + pref.slice(1);
+  applyThemeColors();
+  if (rawData) applyFilter();
+  if (chatData) renderByChat();
+}
+function cycleTheme() {
+  const next = THEME_ORDER[(THEME_ORDER.indexOf(themePref()) + 1) % THEME_ORDER.length];
+  try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
+  applyTheme();
+}
+if (window.matchMedia) {
+  const mq = window.matchMedia('(prefers-color-scheme: light)');
+  const onOSChange = () => { if (themePref() === 'auto') applyTheme(); };
+  if (mq.addEventListener) mq.addEventListener('change', onOSChange); else if (mq.addListener) mq.addListener(onOSChange);
+}
+
 // multiKeyBackground defaults to white and is drawn behind each tooltip swatch,
 // peeking out as a thin white border on plain-box charts — make it transparent.
 Chart.defaults.plugins.tooltip.multiKeyBackground = 'transparent';
@@ -946,7 +1133,7 @@ function setRange(range) {
 
 function setHourlyTZ(mode) {
   hourlyTZ = mode;
-  document.querySelectorAll('.tz-btn').forEach(btn =>
+  document.querySelectorAll('.tz-btn[data-tz]').forEach(btn =>
     btn.classList.toggle('active', btn.dataset.tz === mode)
   );
   applyFilter();
@@ -1123,6 +1310,11 @@ function updateURL() {
   const params = new URLSearchParams();
   if (selectedRange !== '30d') params.set('range', selectedRange);
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
+  if (chatPreset !== '7d') params.set('chat', chatPreset);
+  if (chatPreset === 'custom') {
+    if (chatFrom) params.set('chat_from', chatFrom);
+    if (chatTo) params.set('chat_to', chatTo);
+  }
   const search = params.toString() ? '?' + params.toString() : '';
   history.replaceState(null, '', window.location.pathname + search);
 }
@@ -1308,6 +1500,7 @@ function applyFilter() {
   renderModelCostTable(lastByModel);
   renderProjectCostTable(lastByProject);
   renderProjectBranchCostTable(lastByProjectBranch);
+  if (chatData) renderByChat();  // the Models filter applies to Cost by Chat too
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
@@ -1943,7 +2136,7 @@ async function loadData() {
       const rangeSel = document.getElementById('range-select');
       if (rangeSel) rangeSel.value = selectedRange;
       // Mark default TZ button active
-      document.querySelectorAll('.tz-btn').forEach(btn =>
+      document.querySelectorAll('.tz-btn[data-tz]').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.tz === hourlyTZ)
       );
       // Build model filter (reads URL for model selection too)
@@ -1966,6 +2159,290 @@ function scheduleAutoRefresh() {
   if (rangeIncludesToday(selectedRange)) {
     autoRefreshTimer = setInterval(loadData, 30000);
   }
+}
+
+// ── Cost by Chat (OpenClaw) ──────────────────────────────────────────────────
+// /api/by-chat returns per-chat token totals split by model; cost is computed
+// here per model with calcCost, same as every other table. The section has its
+// own date range (default last 7 days) and polls every 30s; the server picks up
+// new transcript lines on each poll, so the totals keep counting up mid-chat.
+const CHAT_PRESETS = ['today', '7d', '30d', 'custom'];
+const CHAT_REFRESH_MS = 30000;
+const CHAT_DONUT_SLICES = 9;  // top N chats get their own slice; the rest are grouped
+const CHAT_COLORS = ['#D97757','#6E97A8','#C9A26B','#7FA98C','#B98AA0','#D9A84E','#9B7EC7','#5BB8A3','#C2705A'];
+const CHAT_GREY = '#8A8784';
+let chatPreset = '7d', chatFrom = '', chatTo = '';
+let chatBasis = 'cost';
+let chatSortCol = 'share', chatSortDir = 'desc';
+let chatData = null, chatRows = [], chatTimer = null, chatReqSeq = 0;
+const chatShown = { cost: 0, tokens: 0 };
+
+function parseLocalDate(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || '');
+  return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null;
+}
+function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+
+// Local-calendar bounds for the chat range -> { from: Date, to: Date|null } (to exclusive).
+function chatRangeBounds() {
+  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+  if (chatPreset === 'today') return { from: midnight, to: null };
+  if (chatPreset === '30d') return { from: addDays(midnight, -29), to: null };
+  if (chatPreset === 'custom') {
+    const f = parseLocalDate(chatFrom), t = parseLocalDate(chatTo);
+    if (f && t && t < f) return { from: t, to: addDays(f, 1) };
+    return { from: f || addDays(midnight, -6), to: t ? addDays(t, 1) : null };
+  }
+  return { from: addDays(midnight, -6), to: null };
+}
+
+function readURLChat() {
+  const p = new URLSearchParams(window.location.search);
+  const c = p.get('chat');
+  chatPreset = CHAT_PRESETS.includes(c) ? c : '7d';
+  chatFrom = p.get('chat_from') || '';
+  chatTo = p.get('chat_to') || '';
+}
+
+function syncChatControls() {
+  document.querySelectorAll('#chat-presets .tz-btn').forEach(b => b.classList.toggle('active', b.dataset.preset === chatPreset));
+  document.querySelectorAll('#chat-basis .tz-btn').forEach(b => b.classList.toggle('active', b.dataset.basis === chatBasis));
+  const custom = document.getElementById('chat-custom');
+  if (custom) custom.hidden = chatPreset !== 'custom';
+  if (chatPreset === 'custom') {
+    const { from, to } = chatRangeBounds();
+    const fi = document.getElementById('chat-from'), ti = document.getElementById('chat-to');
+    if (fi && !fi.value) fi.value = chatFrom || localISODate(from);
+    if (ti && !ti.value) ti.value = chatTo || localISODate(to ? addDays(to, -1) : new Date());
+  }
+}
+
+function setChatPreset(p) {
+  chatPreset = p;
+  if (p === 'custom') {
+    const fi = document.getElementById('chat-from'), ti = document.getElementById('chat-to');
+    if (!chatFrom) chatFrom = localISODate(addDays(new Date(), -6));
+    if (!chatTo) chatTo = localISODate(new Date());
+    if (fi) fi.value = chatFrom;
+    if (ti) ti.value = chatTo;
+  }
+  syncChatControls();
+  updateURL();
+  loadByChat();
+}
+
+function onChatCustomChange() {
+  chatFrom = document.getElementById('chat-from').value;
+  chatTo = document.getElementById('chat-to').value;
+  updateURL();
+  loadByChat();
+}
+
+function setChatBasis(b) {
+  chatBasis = b;
+  syncChatControls();
+  renderByChat();
+}
+
+function setChatSort(col) {
+  if (chatSortCol === col) chatSortDir = chatSortDir === 'desc' ? 'asc' : 'desc';
+  else { chatSortCol = col; chatSortDir = 'desc'; }
+  renderByChat();
+}
+
+async function loadByChat() {
+  const seq = ++chatReqSeq;
+  const { from, to } = chatRangeBounds();
+  const q = new URLSearchParams({ from: from.toISOString() });
+  if (to) q.set('to', to.toISOString());
+  const live = document.getElementById('chat-live');
+  try {
+    const resp = await fetch('/api/by-chat?' + q.toString());
+    const d = await resp.json();
+    if (seq !== chatReqSeq) return;  // a newer range request superseded this one
+    if (d.error) {
+      document.getElementById('chat-live-text').textContent = d.error;
+      if (live) live.classList.add('stale');
+      return;
+    }
+    chatData = d;
+    renderByChat();
+    if (live) {
+      live.classList.remove('stale');
+      live.classList.remove('pulse'); void live.offsetWidth; live.classList.add('pulse');
+    }
+    document.getElementById('chat-live-text').textContent =
+      'Live · ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch (e) {
+    console.error(e);
+    if (live) live.classList.add('stale');
+    document.getElementById('chat-live-text').textContent = 'Offline — retrying';
+  }
+}
+
+function scheduleChatRefresh() {
+  if (chatTimer) clearInterval(chatTimer);
+  chatTimer = setInterval(() => { if (!document.hidden) loadByChat(); }, CHAT_REFRESH_MS);
+}
+
+// Bucket rows for the current model filter: tokens + per-model cost.
+function buildChatRows(buckets) {
+  const useFilter = allModelsList.length > 0;  // model filter applies once the main data has loaded
+  const rows = [];
+  for (const b of buckets) {
+    const r = { id: b.id, label: b.label, kind: b.kind, sessions: b.sessions,
+                input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 };
+    for (const [model, m] of Object.entries(b.models)) {
+      if (useFilter && allModelsList.includes(model) && !selectedModels.has(model)) continue;
+      r.input += m.input; r.output += m.output;
+      r.cache_read += m.cache_read; r.cache_creation += m.cache_creation;
+      r.cost += calcCost(model, m.input, m.output, m.cache_read, m.cache_creation);
+    }
+    r.tokens = r.input + r.output + r.cache_read + r.cache_creation;
+    if (r.tokens > 0) rows.push(r);
+  }
+  return rows;
+}
+
+function chatValue(r) { return chatBasis === 'cost' ? r.cost : r.tokens; }
+function pct(x) { return x >= 10 ? x.toFixed(0) + '%' : x >= 0.1 ? x.toFixed(1) + '%' : x > 0 ? '<0.1%' : '0%'; }
+const CHAT_KIND_LABEL = { channel: 'channel', dm: 'DM', cron: 'automation', unmapped: '', outside: '', other: '' };
+
+// Ease the headline totals up to their new value so the counters visibly tick.
+function tweenTo(el, key, target, format) {
+  const start = chatShown[key] || 0;
+  chatShown[key] = target;
+  if (prefersReducedMotion || !start || start === target) { el.textContent = format(target); return; }
+  const t0 = performance.now(), dur = 700;
+  const step = (now) => {
+    const k = Math.min(1, (now - t0) / dur);
+    el.textContent = format(start + (target - start) * (1 - Math.pow(1 - k, 3)));
+    if (k < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+function renderByChat() {
+  if (!chatData) return;
+  const rows = buildChatRows(chatData.buckets || []);
+  const totalCost = rows.reduce((s, r) => s + r.cost, 0);
+  const totalTokens = rows.reduce((s, r) => s + r.tokens, 0);
+  const total = chatBasis === 'cost' ? totalCost : totalTokens;
+  for (const r of rows) r.share = total > 0 ? chatValue(r) / total * 100 : 0;
+
+  // Colours follow rank by share (not the table sort), so slices and rows match.
+  const ranked = [...rows].sort((a, b) => chatValue(b) - chatValue(a));
+  const named = ranked.filter(r => r.kind !== 'unmapped' && r.kind !== 'outside');
+  named.forEach((r, i) => { r.color = i < CHAT_DONUT_SLICES ? CHAT_COLORS[i % CHAT_COLORS.length] : CHAT_GREY; });
+  ranked.forEach(r => { if (!r.color) r.color = CHAT_GREY; });
+
+  tweenTo(document.getElementById('chat-total-cost'), 'cost', totalCost, fmtCostBig);
+  tweenTo(document.getElementById('chat-total-tokens'), 'tokens', totalTokens, v => fmt(Math.round(v)));
+
+  // Coverage: how much of the spend we could attribute to a chat.
+  const un = rows.find(r => r.kind === 'unmapped');
+  const out = rows.find(r => r.kind === 'outside');
+  const unShare = un && total > 0 ? chatValue(un) / total * 100 : 0;
+  const outShare = out && total > 0 ? chatValue(out) / total * 100 : 0;
+  const mapped = 100 - unShare - outShare;
+  let cov = '<strong>' + (mapped >= 99.95 ? '100%' : mapped.toFixed(1) + '%') + '</strong> mapped to a chat · <strong>' + pct(unShare) + '</strong> unmapped' +
+            (un ? ' (' + un.sessions + ' session' + (un.sessions === 1 ? '' : 's') + ')' : '');
+  if (out) cov += '<br>' + pct(outShare) + ' Claude Code outside OpenClaw';
+  document.getElementById('chat-coverage').innerHTML = rows.length ? cov : '';
+
+  renderChatDonut(ranked);
+
+  const sorted = [...rows].sort((a, b) => {
+    const k = chatSortCol === 'share' ? null : chatSortCol;
+    const av = k ? a[k] : chatValue(a), bv = k ? b[k] : chatValue(b);
+    return chatSortDir === 'desc' ? bv - av : av - bv;
+  });
+  chatRows = sorted;
+  document.querySelectorAll('[id^="csort-"]').forEach(el => {
+    el.textContent = el.id === 'csort-' + chatSortCol ? (chatSortDir === 'desc' ? '▼' : '▲') : '';
+  });
+  const body = document.getElementById('chat-body');
+  if (!sorted.length) {
+    body.innerHTML = '<tr><td colspan="9" class="chat-empty">No usage in this range yet.</td></tr>';
+    return;
+  }
+  body.innerHTML = sorted.map(r => {
+    const kind = CHAT_KIND_LABEL[r.kind] || '';
+    return '<tr>' +
+      '<td><span class="chat-name"><span class="chat-swatch" style="background:' + r.color + '"></span>' + esc(r.label) +
+        (kind ? '<span class="chat-kind">' + kind + '</span>' : '') + '</span></td>' +
+      '<td class="share-cell">' + pct(r.share) + '<div class="share-bar"><span style="width:' + Math.max(0, Math.min(100, r.share)).toFixed(2) + '%;background:' + r.color + '"></span></div></td>' +
+      '<td class="cost">' + fmtCostBig(r.cost) + '</td>' +
+      '<td>' + fmt(r.tokens) + '</td>' +
+      '<td>' + fmt(r.input) + '</td>' +
+      '<td>' + fmt(r.output) + '</td>' +
+      '<td>' + fmt(r.cache_read) + '</td>' +
+      '<td>' + fmt(r.cache_creation) + '</td>' +
+      '<td>' + r.sessions + '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+function renderChatDonut(ranked) {
+  const canvas = document.getElementById('chart-chat');
+  if (!canvas) return;
+  const named = ranked.filter(r => r.kind !== 'unmapped' && r.kind !== 'outside');
+  const top = named.slice(0, CHAT_DONUT_SLICES);
+  const rest = ranked.filter(r => !top.includes(r));
+  const slices = top.map(r => ({ label: r.label, value: chatValue(r), share: r.share, cost: r.cost, color: r.color }));
+  if (rest.length) {
+    const v = rest.reduce((s, r) => s + chatValue(r), 0);
+    if (v > 0) slices.push({ label: 'Everything else', value: v,
+      share: rest.reduce((s, r) => s + r.share, 0), cost: rest.reduce((s, r) => s + r.cost, 0), color: CHAT_GREY });
+  }
+  const data = {
+    labels: slices.map(s => s.label),
+    datasets: [{ data: slices.map(s => s.value), backgroundColor: slices.map(s => s.color),
+                 hoverBackgroundColor: slices.map(s => s.color), hoverOffset: 6,
+                 borderWidth: 2, borderColor: C.card, hoverBorderColor: C.card }],
+  };
+  // Update in place on polls (no flicker); rebuild only when first drawn or after a theme change.
+  if (charts.chat && charts.chat.$themeCard === C.card) {
+    charts.chat.data.labels = data.labels;
+    charts.chat.data.datasets[0].data = data.datasets[0].data;
+    charts.chat.data.datasets[0].backgroundColor = data.datasets[0].backgroundColor;
+    charts.chat.data.datasets[0].hoverBackgroundColor = data.datasets[0].hoverBackgroundColor;
+    charts.chat.$slices = slices;
+    charts.chat.update();
+    return;
+  }
+  if (charts.chat) charts.chat.destroy();
+  charts.chat = new Chart(canvas.getContext('2d'), {
+    type: 'doughnut',
+    data,
+    options: {
+      responsive: true, maintainAspectRatio: false, resizeDelay: 150, cutout: '62%',
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: ctx => {
+          const s = (ctx.chart.$slices || [])[ctx.dataIndex] || {};
+          return ' ' + ctx.label + ': ' + pct(s.share || 0) + ' · ' + fmtCostBig(s.cost || 0);
+        } } },
+      },
+    },
+  });
+  charts.chat.$slices = slices;
+  charts.chat.$themeCard = C.card;
+}
+
+function exportChatCSV() {
+  const header = ['Chat', 'Kind', 'Share % (' + chatBasis + ')', 'Est. Cost', 'Total Tokens', 'Input', 'Output', 'Cache Read', 'Cache Write', 'Sessions'];
+  const rows = chatRows.map(r => [r.label, r.kind, r.share.toFixed(2), r.cost.toFixed(4), r.tokens,
+                                  r.input, r.output, r.cache_read, r.cache_creation, r.sessions]);
+  downloadCSV('cost_by_chat', header, rows);
+}
+
+function initByChat() {
+  readURLChat();
+  syncChatControls();
+  loadByChat();
+  scheduleChatRefresh();
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) loadByChat(); });
 }
 
 // ── Footer meta: version, extension promo, update check ──────────────────────
@@ -2182,8 +2659,10 @@ function initSectionNav() {
 
 initFooterMeta();
 initSectionNav();
+applyTheme();
 loadData();
 scheduleAutoRefresh();
+initByChat();
 </script>
 </body>
 </html>
@@ -2209,6 +2688,57 @@ def find_icon_file():
         if candidate.is_file():
             return candidate
     return None
+
+
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z?)?$")
+
+
+def _clean_iso(value):
+    """Accept only plain ISO dates/instants for the by-chat range (anything else -> None)."""
+    if value and _ISO_RE.match(value):
+        return value
+    return None
+
+
+# Live counters: each /api/by-chat poll kicks off an incremental scan (at most
+# once per LIVE_SCAN_INTERVAL, in the background) so new turns from running
+# chats land in the DB without anyone pressing Rescan.
+LIVE_SCAN_INTERVAL = 25.0
+_live_scan_lock = threading.Lock()
+_live_scan_state = {"last": 0.0}
+
+
+def _maybe_live_scan(db_path):
+    now = time.time()
+    if now - _live_scan_state["last"] < LIVE_SCAN_INTERVAL:
+        return
+    if not _live_scan_lock.acquire(blocking=False):
+        return
+    _live_scan_state["last"] = now
+
+    def run():
+        try:
+            import scanner
+            scanner.scan(db_path=db_path, projects_dirs=scanner.DEFAULT_PROJECTS_DIRS, verbose=False)
+        except Exception:
+            pass
+        finally:
+            _live_scan_lock.release()
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def get_by_chat_payload(db_path, start_iso=None, end_iso=None, live_scan=True):
+    if openclaw_attrib is None:
+        return {"error": "OpenClaw attribution module not available"}
+    if not Path(db_path).exists():
+        return {"error": "Database not found. Run: python cli.py scan"}
+    if live_scan:
+        _maybe_live_scan(db_path)
+    data = openclaw_attrib.get_by_chat_data(db_path, start_iso, end_iso)
+    data["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data["from"], data["to"] = start_iso, end_iso
+    return data
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -2244,6 +2774,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif path == "/api/by-chat":
+            params = parse_qs(urlparse(self.path).query)
+            data = get_by_chat_payload(
+                DB_PATH,
+                _clean_iso((params.get("from") or [None])[0]),
+                _clean_iso((params.get("to") or [None])[0]),
+            )
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 
