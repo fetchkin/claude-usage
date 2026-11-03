@@ -1,0 +1,7 @@
+[
+  {
+    "date": "2026-11-03",
+    "label": "/handover installed",
+    "detail": "/handover skill + auto-suggest at 800k context: long chats hand over to a fresh session instead of re-reading a huge context"
+  }
+]
