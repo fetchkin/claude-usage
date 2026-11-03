@@ -1764,8 +1764,9 @@ const eventMarkerPlugin = {
 
 // Before/after line under the daily chart: the 7 days before each visible
 // event vs the days since it (event day through today). Tokens per turn is the
-// headline because how much we use varies day to day; per-day cost averages
-// completed days only (today alone if none are complete yet).
+// headline because how much we use varies day to day. Cost per day averages
+// days that had usage (this PC is off some days, and a zero day would drag the
+// average down), using completed days only once there is one after the event.
 function eventWindowStats(fromISO, toISO, completedBeforeISO) {
   let tokens = 0, turns = 0, cost = 0, costDone = 0;
   const days = new Set(), doneDays = new Set();
@@ -1773,10 +1774,11 @@ function eventWindowStats(fromISO, toISO, completedBeforeISO) {
     if (!selectedModels.has(r.model) || r.day < fromISO || r.day > toISO) continue;
     const c = calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation);
     tokens += r.input + r.output + r.cache_read + r.cache_creation;
-    turns += r.turns; cost += c;
-    if (!completedBeforeISO || r.day < completedBeforeISO) costDone += c;
+    turns += r.turns; cost += c; days.add(r.day);
+    if (!completedBeforeISO || r.day < completedBeforeISO) { costDone += c; doneDays.add(r.day); }
   }
-  return { tokens, turns, cost, costDone, perTurn: turns ? tokens / turns : 0 };
+  const perDay = doneDays.size ? costDone / doneDays.size : (days.size ? cost / days.size : 0);
+  return { perTurn: turns ? tokens / turns : 0, perDay, activeDays: doneDays.size || days.size };
 }
 function renderEventCompare(labels) {
   const el = document.getElementById('daily-events');
@@ -1795,7 +1797,6 @@ function renderEventCompare(labels) {
     const after = eventWindowStats(e.date, today, today);
     const spanDays = Math.max(1, Math.round((parseLocalDate(today) - d0) / 86400000) + 1);
     const fullDays = spanDays - 1;  // event day .. yesterday
-    const afterPerDay = fullDays >= 1 ? after.costDone / fullDays : after.cost;
     const sinceLabel = d0.getDate() + ' ' + d0.toLocaleDateString('en-GB', { month: 'short' });
     const verdict = fullDays < 2
       ? ` <span class="ev-muted">· too early to tell (${fullDays} full day${fullDays === 1 ? '' : 's'} after)</span>`
@@ -1803,8 +1804,8 @@ function renderEventCompare(labels) {
     return `<div title="${esc(e.detail || '')}"><span class="ev-label">${esc(e.label)}</span> `
       + `<span class="ev-muted">${esc(e.date)}</span> — `
       + `tokens/turn ${fmt(before.perTurn)} → ${fmt(after.perTurn)}${pctChange(after.perTurn, before.perTurn)}, `
-      + `est. cost/day ${fmtCostBig(before.cost / 7)} → ${fmtCostBig(afterPerDay)}${pctChange(afterPerDay, before.cost / 7)} `
-      + `<span class="ev-muted">· 7 days before vs since ${esc(sinceLabel)} (${spanDays} day${spanDays === 1 ? '' : 's'})</span>`
+      + `est. cost/day ${fmtCostBig(before.perDay)} → ${fmtCostBig(after.perDay)}${pctChange(after.perDay, before.perDay)} `
+      + `<span class="ev-muted">· 7 days before (${before.activeDays} with usage) vs since ${esc(sinceLabel)} (${spanDays} day${spanDays === 1 ? '' : 's'})</span>`
       + verdict + `</div>`;
   }).join('');
   el.hidden = false;
