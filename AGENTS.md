@@ -167,3 +167,13 @@ The repo has a self-contained slash command at [.claude/commands/triage.md](.cla
 Register the Windows Task Scheduler entry with [scripts/setup-weekly-triage.ps1](scripts/setup-weekly-triage.ps1). Logs go to `logs/triage-*.log`.
 
 If you're working on this repo and want to invoke the routine ad-hoc, just type `/triage` in Claude Code. Hard safety rails (test-passing gates, no security-sensitive auto-merges, no scope-changing merges, Codex sign-off required on closures) live inside `triage.md`.
+
+## Fetchkin fork: Cost by Chat (OpenClaw)
+
+[openclaw_attrib.py](openclaw_attrib.py) maps each Claude session to the OpenClaw chat that ran it (Slack channel, main DM, automation), and `/api/by-chat` serves the "Cost by Chat" card.
+
+- It reads OpenClaw state **read-only** (`~/.openclaw/agents/*/agent/openclaw-agent.sqlite` session_nodes + conversations, `~/.openclaw/state/openclaw.sqlite` subagent_runs + cron_jobs). Override the location with `OPENCLAW_HOME`.
+- Signals: the current `cliSessionIds`/`cliSessionBindings` per session key first. For rolled-over sessions it falls back to a marker taken from the transcript's first prompt (`[cron:<id>]`, `"chat_id": "channel:<C…>"`, or a hash of the `[Subagent Task]` text matched to subagent_runs). Subagents roll up via requester links, threads roll up to their channel, and cron `:run:` keys roll up to their job.
+- Only the derived marker is cached (`openclaw_hints` table in usage.db). Never store or log prompt text.
+- Each `/api/by-chat` poll triggers a throttled background incremental scan (`LIVE_SCAN_INTERVAL`), so the counters stay live.
+- The page has a light/dark/auto theme toggle; `?theme=light|dark` forces one, which is useful for screenshots.
