@@ -378,7 +378,10 @@ class TestRangeAggregation(unittest.TestCase):
         self.assertEqual(by_id[CHAN]["sessions"], 1)  # two turns in range, still one session
         self.assertEqual(self.data("2026-10-27", "2026-10-27")["totals"]["sessions"], 1)
         empty = self.data("2026-10-30", "2026-11-01")
-        self.assertEqual((empty["totals"]["sessions"], empty["buckets"]), (0, []))
+        self.assertEqual(empty["totals"]["sessions"], 0)
+        # Only the always-listed laptop bucket, at zero.
+        self.assertEqual([(b["id"], b["sessions"], b["models"]) for b in empty["buckets"]],
+                         [(oa.OUTSIDE_ID, 0, {})])
         day28 = self.data("2026-10-28", "2026-10-28")["days"]
         self.assertEqual([(x["date"], x["sessions"], x["turns"], x["tokens"]) for x in day28],
                          [("2026-10-28", 2, 3, 40)])

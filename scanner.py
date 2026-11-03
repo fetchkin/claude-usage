@@ -123,6 +123,26 @@ def init_db(conn):
     # column-add event), so it also covers DBs that gained the column from an
     # earlier build that predated the backfill.
     _ensure_column(conn, "sessions", "topic", "TEXT")
+    # One row per tool call: the tool_use (name, args size) joined to its
+    # tool_result (result size) by tool_use_id. Sizes are characters; token
+    # counts are estimated at query time. Added in a later schema version and
+    # backfilled once by scan() via the 'tool_calls_backfill_done' marker.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tool_calls (
+            tool_use_id   TEXT PRIMARY KEY,
+            session_id    TEXT,
+            agent_id      TEXT,
+            timestamp     TEXT,
+            tool_name     TEXT,
+            input_chars   INTEGER DEFAULT 0,
+            result_ts     TEXT,
+            result_chars  INTEGER,
+            result_images INTEGER DEFAULT 0,
+            is_error      INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_calls_ts ON tool_calls(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id)")
     # Conditional unique index: only dedup non-null message IDs
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
@@ -314,8 +334,122 @@ def upsert_agents(conn, agents):
     ])
 
 
-def parse_jsonl_file(filepath):
+def _result_size(content):
+    """(text_chars, image_count) of a tool_result's content (str or block list)."""
+    if isinstance(content, str):
+        return len(content), 0
+    chars = images = 0
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "image":
+                images += 1
+            elif isinstance(block.get("text"), str):
+                chars += len(block["text"])
+            else:
+                chars += len(json.dumps(block, ensure_ascii=False))
+    return chars, images
+
+
+def extract_tool_events(record, sink):
+    """Append this record's tool_use / tool_result blocks to `sink`.
+
+    Assistant records carry tool_use blocks (name + input); the following user
+    record carries the matching tool_result. Both are keyed by tool_use id so
+    streaming replays and rescans collapse onto one row (see upsert_tool_calls).
+    """
+    rtype = record.get("type")
+    msg = record.get("message")
+    if rtype not in ("assistant", "user") or not isinstance(msg, dict):
+        return
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if rtype == "assistant" and item.get("type") == "tool_use" and item.get("id"):
+            sink.append({
+                "kind": "use", "id": item["id"], "name": item.get("name") or "unknown",
+                "session_id": record.get("sessionId"), "agent_id": record_agent_id(record),
+                "timestamp": record.get("timestamp", ""),
+                "input_chars": len(json.dumps(item.get("input") or {}, ensure_ascii=False)),
+            })
+        elif rtype == "user" and item.get("type") == "tool_result" and item.get("tool_use_id"):
+            chars, images = _result_size(item.get("content"))
+            sink.append({
+                "kind": "result", "id": item["tool_use_id"],
+                "session_id": record.get("sessionId"), "agent_id": record_agent_id(record),
+                "timestamp": record.get("timestamp", ""),
+                "chars": chars, "images": images, "is_error": 1 if item.get("is_error") else 0,
+            })
+
+
+def upsert_tool_calls(conn, events):
+    """Merge tool_use / tool_result events into tool_calls (idempotent per id)."""
+    uses = [e for e in events if e["kind"] == "use"]
+    results = [e for e in events if e["kind"] == "result"]
+    if uses:
+        conn.executemany("""
+            INSERT INTO tool_calls (tool_use_id, session_id, agent_id, timestamp, tool_name, input_chars)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tool_use_id) DO UPDATE SET
+                session_id  = excluded.session_id,
+                agent_id    = excluded.agent_id,
+                timestamp   = excluded.timestamp,
+                tool_name   = excluded.tool_name,
+                input_chars = excluded.input_chars
+        """, [(e["id"], e["session_id"], e["agent_id"], e["timestamp"], e["name"], e["input_chars"])
+              for e in uses])
+    if results:
+        conn.executemany("""
+            INSERT INTO tool_calls (tool_use_id, session_id, agent_id, result_ts,
+                                    result_chars, result_images, is_error)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tool_use_id) DO UPDATE SET
+                result_ts     = excluded.result_ts,
+                result_chars  = excluded.result_chars,
+                result_images = excluded.result_images,
+                is_error      = excluded.is_error
+        """, [(e["id"], e["session_id"], e["agent_id"], e["timestamp"], e["chars"], e["images"],
+               e["is_error"]) for e in results])
+
+
+def _backfill_tool_calls(conn, jsonl_files):
+    """One-time pass over already-processed transcripts to fill tool_calls.
+
+    Files already in processed_files are only re-read past their stored line
+    count, so without this the By-tool view would start empty on an existing DB.
+    """
+    done = {r["path"] for r in conn.execute("SELECT path FROM processed_files")}
+    n = 0
+    for filepath in jsonl_files:
+        if filepath not in done:
+            continue  # the main scan loop reads it in full anyway
+        events = []
+        try:
+            with open(filepath, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if '"tool_use' not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    extract_tool_events(record, events)
+        except OSError:
+            continue
+        upsert_tool_calls(conn, events)
+        n += len(events)
+    return n
+
+
+def parse_jsonl_file(filepath, tool_events=None):
     """Parse a JSONL file and return (session_metas, turns, agents, line_count).
+
+    If `tool_events` is a list, tool_use / tool_result events are appended to
+    it (see extract_tool_events).
 
     Deduplicates streaming events by message.id — Claude Code logs multiple
     JSONL records per API response, all sharing the same message.id. Only the
@@ -345,6 +479,9 @@ def parse_jsonl_file(filepath):
                 session_id = record.get("sessionId")
                 if not session_id:
                     continue
+
+                if tool_events is not None:
+                    extract_tool_events(record, tool_events)
 
                 # Extract session title from title records
                 title = _extract_title(record)
@@ -606,6 +743,15 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
         if verbose and filled:
             print(f"Backfilled topic for {filled} existing session(s).")
 
+    # One-time tool_calls backfill (same pattern as topics above). A fresh DB
+    # has no processed files, so this only does work on an upgraded DB.
+    if _meta_get(conn, "tool_calls_backfill_done") != "1":
+        filled = _backfill_tool_calls(conn, jsonl_files)
+        _meta_set(conn, "tool_calls_backfill_done", "1")
+        conn.commit()
+        if verbose and filled:
+            print(f"Backfilled {filled} tool call event(s).")
+
     new_files = 0
     updated_files = 0
     skipped_files = 0
@@ -634,8 +780,10 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
 
         if is_new:
             # New file: full parse (single read, returns line count)
-            session_metas, turns, agents, line_count = parse_jsonl_file(filepath)
+            tool_events = []
+            session_metas, turns, agents, line_count = parse_jsonl_file(filepath, tool_events)
             upsert_agents(conn, agents)
+            upsert_tool_calls(conn, tool_events)
 
             if turns or session_metas:
                 sessions = aggregate_sessions(session_metas, turns)
@@ -653,6 +801,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
             turns_no_id = []
             new_session_metas = {}
             agents = {}         # agent_id -> dispatch dict
+            tool_events = []
             line_count = 0
 
             try:
@@ -675,6 +824,8 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                         session_id = record.get("sessionId")
                         if not session_id:
                             continue
+
+                        extract_tool_events(record, tool_events)
 
                         # Extract session title from title records
                         title = _extract_title(record)
@@ -777,6 +928,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
 
             new_turns = turns_no_id + list(seen_messages.values())
             upsert_agents(conn, list(agents.values()))
+            upsert_tool_calls(conn, tool_events)
 
             if new_turns or new_session_metas:
                 sessions = aggregate_sessions(list(new_session_metas.values()), new_turns)

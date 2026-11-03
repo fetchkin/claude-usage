@@ -499,11 +499,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .share-bar > span { display: block; height: 100%; border-radius: 3px; }
   #chat-body td { font-variant-numeric: tabular-nums; }
   .chat-empty { color: var(--muted); padding: 24px 12px; text-align: center; }
+  .tool-note { font-size: 12px; color: var(--muted); line-height: 1.6; margin: 0 0 14px; max-width: 900px; }
+  .tool-note strong { color: var(--text); font-weight: 600; }
+  .tool-select { padding: 4px 8px; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; max-width: 280px; }
+  .tool-select:focus { border-color: var(--accent); outline: none; }
+  .tool-range { font-size: 12px; color: var(--muted); }
+  .tool-name { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+  .tool-totals { flex-wrap: wrap; }
+  #tool-more { margin-top: 10px; }
+  #by-tool-table td.num, #by-tool-table th.num { text-align: right; }
   @media (max-width: 768px) {
     .chat-grid { grid-template-columns: 1fr; }
     .chat-live { margin-left: 0; }
     /* Phone: keep chat, share, cost; the token split is in the CSV. */
     #sec-by-chat th:nth-child(n+4), #sec-by-chat td:nth-child(n+4) { display: none; }
+    #sec-by-tool th:nth-child(n+4), #sec-by-tool td:nth-child(n+4) { display: none; }
     #sec-by-chat .chat-kind { display: none; }
     #sec-by-chat .share-cell { min-width: 64px; }
     #sec-by-chat { padding: 14px; }
@@ -574,6 +584,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <nav id="jump-bar" aria-label="Jump to section">
   <button class="jump-link" data-target="stats-row">Overview</button>
   <button class="jump-link" data-target="sec-by-chat">By Chat</button>
+  <button class="jump-link" data-target="sec-by-tool">By Tool</button>
   <div class="jump-menu">
     <button type="button" class="jump-trigger" aria-haspopup="true" aria-expanded="false">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M8 17v-4"/><path d="M13 17V8"/><path d="M18 17v-7"/></svg>
@@ -645,10 +656,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <th class="sortable" onclick="setChatSort('cache_read')">Cache Read <span class="sort-icon" id="csort-cache_read"></span></th>
             <th class="sortable" onclick="setChatSort('cache_creation')">Cache Write <span class="sort-icon" id="csort-cache_creation"></span></th>
             <th class="sortable" onclick="setChatSort('sessions')" title="Distinct Claude Code sessions (transcripts) with at least one turn in this range. A channel reuses one session until it resets; every automation run and every subagent worker is its own session.">Sessions <span class="sort-icon" id="csort-sessions"></span></th>
+            <th class="sortable" onclick="setChatSort('context')" title="Current context size: the prompt size (input + cache read + cache write) of this chat's most recently active session, at its last turn in the range. Every new turn in that session re-reads about this much, mostly as cache reads. Hover a value for the chat's other recent sessions.">Context now <span class="sort-icon" id="csort-context"></span></th>
           </tr></thead>
           <tbody id="chat-body"></tbody>
         </table>
       </div>
+    </div>
+  </div>
+  <div class="table-card" id="sec-by-tool" data-card="by-tool">
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Context by Tool <span class="chat-kind">estimate</span> <span class="info-icon" tabindex="0" role="img" aria-label="About this section" title="Per tool: how many calls, and roughly how many tokens their results added to context. Estimated from the size of each tool result in the transcripts (about 4 characters per token, about 1,600 tokens per image), not from the API. Uses the Cost by Chat date range above."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportToolCSV()" title="Export the per-tool breakdown to CSV">&#x2913; CSV</button></div>
+    <p class="tool-note"><strong>Estimate.</strong> Tools aren't billed separately. Their results go into the prompt and stay in context, so every later turn re-reads them, mostly as cache reads, until the session is compacted or reset. <strong>Result tokens</strong> is the size of the results (about 4 characters per token). <strong>Re-read</strong> is result tokens &times; later turns in the same context within the range, stopping at a compaction.</p>
+    <div class="chat-controls">
+      <select class="tool-select" id="tool-chat" aria-label="Filter by chat" onchange="setToolChat(this.value)"><option value="">All chats</option></select>
+      <span class="tool-range" id="tool-range"></span>
+    </div>
+    <div class="chat-totals tool-totals">
+      <div><div class="label">Est. result tokens</div><div class="value" id="tool-total-result">&mdash;</div></div>
+      <div><div class="label">Est. re-read</div><div class="value" id="tool-total-reread">&mdash;</div></div>
+      <div><div class="label">Calls</div><div class="value" id="tool-total-calls">&mdash;</div></div>
+    </div>
+    <div class="chat-table-col">
+      <table id="by-tool-table">
+        <thead><tr>
+          <th>Tool</th>
+          <th class="sortable num" onclick="setToolSort('result_tokens')" title="Estimated tokens of all results from this tool (characters / 4, plus about 1,600 per image).">Result tokens <span class="sort-icon" id="tsort-result_tokens"></span></th>
+          <th class="sortable num" onclick="setToolSort('calls')">Calls <span class="sort-icon" id="tsort-calls"></span></th>
+          <th class="sortable num" onclick="setToolSort('avg_result_tokens')" title="Average estimated result tokens per call; hover for the largest single result.">Avg / call <span class="sort-icon" id="tsort-avg_result_tokens"></span></th>
+          <th class="sortable num" onclick="setToolSort('reread_tokens')" title="Result tokens multiplied by the number of later turns in the same context within the range, stopping at a compaction. Roughly the cache reads these results caused.">Re-read <span class="sort-icon" id="tsort-reread_tokens"></span></th>
+          <th class="sortable num" onclick="setToolSort('input_tokens')" title="Estimated tokens of the call arguments (written by the model, so output tokens).">Args <span class="sort-icon" id="tsort-input_tokens"></span></th>
+          <th class="sortable num" onclick="setToolSort('sessions')">Sessions <span class="sort-icon" id="tsort-sessions"></span></th>
+          <th class="sortable num" onclick="setToolSort('errors')">Errors <span class="sort-icon" id="tsort-errors"></span></th>
+        </tr></thead>
+        <tbody id="tool-body"></tbody>
+      </table>
+      <button class="export-btn" id="tool-more" hidden onclick="toolShowAll = !toolShowAll; renderByTool()"></button>
     </div>
   </div>
   <div class="charts-grid">
@@ -1311,6 +1352,7 @@ function updateURL() {
   if (selectedRange !== '30d') params.set('range', selectedRange);
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
   if (chatPreset !== '7d') params.set('chat', chatPreset);
+  if (toolChat) params.set('tool_chat', toolChat);
   if (chatPreset === 'custom') {
     if (chatFrom) params.set('chat_from', chatFrom);
     if (chatTo) params.set('chat_to', chatTo);
@@ -2171,6 +2213,7 @@ const CHAT_REFRESH_MS = 30000;
 const CHAT_DONUT_SLICES = 9;  // top N chats get their own slice; the rest are grouped
 const CHAT_COLORS = ['#D97757','#6E97A8','#C9A26B','#7FA98C','#B98AA0','#D9A84E','#9B7EC7','#5BB8A3','#C2705A'];
 const CHAT_GREY = '#8A8784';
+const CHAT_OUTSIDE = '#4F7CAC';  // Claude Code on this laptop (not via OpenClaw)
 let chatPreset = '7d', chatFrom = '', chatTo = '';
 let chatBasis = 'cost';
 let chatSortCol = 'share', chatSortDir = 'desc';
@@ -2198,6 +2241,7 @@ function chatRangeBounds() {
 
 function readURLChat() {
   const p = new URLSearchParams(window.location.search);
+  toolChat = p.get('tool_chat') || '';
   const c = p.get('chat');
   chatPreset = CHAT_PRESETS.includes(c) ? c : '7d';
   chatFrom = p.get('chat_from') || '';
@@ -2263,6 +2307,7 @@ async function loadByChat() {
     q.set('range', chatPreset);
   }
   const live = document.getElementById('chat-live');
+  loadByTool(q);
   try {
     const resp = await fetch('/api/by-chat?' + q.toString());
     const d = await resp.json();
@@ -2307,6 +2352,7 @@ function buildChatRows(buckets) {
   const rows = [];
   for (const b of buckets) {
     const r = { id: b.id, label: b.label, kind: b.kind, sessions: b.sessions,
+                context: b.context || 0, context_sessions: b.context_sessions || [],
                 input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 };
     for (const [model, m] of Object.entries(b.models)) {
       if (useFilter && allModelsList.includes(model) && !selectedModels.has(model)) continue;
@@ -2315,7 +2361,7 @@ function buildChatRows(buckets) {
       r.cost += calcCost(model, m.input, m.output, m.cache_read, m.cache_creation);
     }
     r.tokens = r.input + r.output + r.cache_read + r.cache_creation;
-    if (r.tokens > 0) rows.push(r);
+    if (r.tokens > 0 || r.kind === 'outside') rows.push(r);  // the laptop bucket always shows
   }
   return rows;
 }
@@ -2350,7 +2396,7 @@ function renderByChat() {
   const ranked = [...rows].sort((a, b) => chatValue(b) - chatValue(a));
   const named = ranked.filter(r => r.kind !== 'unmapped' && r.kind !== 'outside');
   named.forEach((r, i) => { r.color = i < CHAT_DONUT_SLICES ? CHAT_COLORS[i % CHAT_COLORS.length] : CHAT_GREY; });
-  ranked.forEach(r => { if (!r.color) r.color = CHAT_GREY; });
+  ranked.forEach(r => { if (!r.color) r.color = r.kind === 'outside' ? CHAT_OUTSIDE : CHAT_GREY; });
 
   tweenTo(document.getElementById('chat-total-cost'), 'cost', totalCost, fmtCostBig);
   tweenTo(document.getElementById('chat-total-tokens'), 'tokens', totalTokens, v => fmt(Math.round(v)));
@@ -2363,7 +2409,8 @@ function renderByChat() {
   const mapped = 100 - unShare - outShare;
   let cov = '<strong>' + (mapped >= 99.95 ? '100%' : mapped.toFixed(1) + '%') + '</strong> mapped to a chat · <strong>' + pct(unShare) + '</strong> unmapped' +
             (un ? ' (' + un.sessions + ' session' + (un.sessions === 1 ? '' : 's') + ')' : '');
-  if (out) cov += '<br>' + pct(outShare) + ' Claude Code outside OpenClaw';
+  if (out) cov += '<br><strong>' + pct(outShare) + '</strong> ' + esc(out.label) +
+             ' (' + out.sessions + ' session' + (out.sessions === 1 ? '' : 's') + ')';
   document.getElementById('chat-coverage').innerHTML = rows.length ? cov : '';
 
   renderChatDonut(ranked);
@@ -2379,7 +2426,7 @@ function renderByChat() {
   });
   const body = document.getElementById('chat-body');
   if (!sorted.length) {
-    body.innerHTML = '<tr><td colspan="9" class="chat-empty">No usage in this range yet.</td></tr>';
+    body.innerHTML = '<tr><td colspan="10" class="chat-empty">No usage in this range yet.</td></tr>';
     return;
   }
   body.innerHTML = sorted.map(r => {
@@ -2395,8 +2442,18 @@ function renderByChat() {
       '<td>' + fmt(r.cache_read) + '</td>' +
       '<td>' + fmt(r.cache_creation) + '</td>' +
       '<td>' + r.sessions + '</td>' +
+      '<td title="' + esc(chatContextTitle(r)) + '">' + (r.context ? fmt(r.context) : '&ndash;') + '</td>' +
     '</tr>';
   }).join('');
+}
+
+// Hover text for the Context column: the chat's most recent sessions.
+function chatContextTitle(r) {
+  const list = r.context_sessions || [];
+  if (!list.length) return 'No main-thread turns in this range';
+  return 'Most recent sessions (context at last turn):\n' + list.map(c =>
+    fmt(c.context) + '  ·  ' + new Date(c.last_ts).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) +
+    '  ·  ' + c.session_id.slice(0, 8)).join('\n');
 }
 
 function renderChatDonut(ranked) {
@@ -2404,6 +2461,8 @@ function renderChatDonut(ranked) {
   if (!canvas) return;
   const named = ranked.filter(r => r.kind !== 'unmapped' && r.kind !== 'outside');
   const top = named.slice(0, CHAT_DONUT_SLICES);
+  const outside = ranked.find(r => r.kind === 'outside' && chatValue(r) > 0);
+  if (outside) top.push(outside);  // never folded into "Everything else"
   const rest = ranked.filter(r => !top.includes(r));
   const slices = top.map(r => ({ label: r.label, value: chatValue(r), share: r.share, cost: r.cost, color: r.color }));
   if (rest.length) {
@@ -2447,11 +2506,105 @@ function renderChatDonut(ranked) {
 }
 
 function exportChatCSV() {
-  const header = ['Chat', 'Kind', 'Share % (' + chatBasis + ')', 'Est. Cost', 'Total Tokens', 'Input', 'Output', 'Cache Read', 'Cache Write', 'Sessions'];
+  const header = ['Chat', 'Kind', 'Share % (' + chatBasis + ')', 'Est. Cost', 'Total Tokens', 'Input', 'Output', 'Cache Read', 'Cache Write', 'Sessions', 'Context Now'];
   const rows = chatRows.map(r => [r.label, r.kind, r.share.toFixed(2), r.cost.toFixed(4), r.tokens,
-                                  r.input, r.output, r.cache_read, r.cache_creation, r.sessions]);
+                                  r.input, r.output, r.cache_read, r.cache_creation, r.sessions, r.context]);
   const r = (chatData && chatData.range) || {};
   downloadCSV('cost_by_chat_' + (r.from || 'start') + '_to_' + (r.to || 'now'), header, rows);
+}
+
+// ── Context by Tool (estimate) ───────────────────────────────────────────────
+// /api/by-tool uses the same range params as /api/by-chat, plus an optional
+// chat bucket id. Token figures are server-side estimates from result sizes.
+let toolChat = '', toolSortCol = 'result_tokens', toolSortDir = 'desc';
+let toolData = null, toolRows = [], toolReqSeq = 0, toolLastQuery = null, toolShowAll = false;
+const TOOL_TOP = 15;
+
+async function loadByTool(q) {
+  if (q) toolLastQuery = new URLSearchParams(q);
+  if (!toolLastQuery) return;
+  const tq = new URLSearchParams(toolLastQuery);
+  if (toolChat) tq.set('chat', toolChat);
+  const seq = ++toolReqSeq;
+  try {
+    const resp = await fetch('/api/by-tool?' + tq.toString());
+    const d = await resp.json();
+    if (seq !== toolReqSeq) return;
+    if (d.error) { document.getElementById('tool-range').textContent = d.error; return; }
+    toolData = d;
+    renderByTool();
+  } catch (e) {
+    console.error(e);
+    document.getElementById('tool-range').textContent = 'Offline, retrying';
+  }
+}
+
+function setToolChat(v) {
+  toolChat = v;
+  updateURL();
+  loadByTool();
+}
+
+function setToolSort(col) {
+  if (toolSortCol === col) toolSortDir = toolSortDir === 'desc' ? 'asc' : 'desc';
+  else { toolSortCol = col; toolSortDir = 'desc'; }
+  renderByTool();
+}
+
+function renderByTool() {
+  if (!toolData) return;
+  const sel = document.getElementById('tool-chat');
+  const opts = [{ id: '', label: 'All chats' }].concat(toolData.chats || []);
+  if (toolChat && !opts.some(c => c.id === toolChat)) opts.push({ id: toolChat, label: toolChat, calls: 0 });
+  sel.innerHTML = opts.map(c => '<option value="' + esc(c.id) + '">' + esc(c.label) +
+    (c.id ? ' (' + fmt(c.calls || 0) + ' calls)' : '') + '</option>').join('');
+  sel.value = toolChat;
+  document.getElementById('tool-range').textContent = chatRangeLabel(toolData.range);
+  const t = toolData.totals || {};
+  document.getElementById('tool-total-result').textContent = '~' + fmt(t.result_tokens || 0);
+  document.getElementById('tool-total-reread').textContent = '~' + fmt(t.reread_tokens || 0);
+  document.getElementById('tool-total-calls').textContent = fmt(t.calls || 0);
+  const rows = [...(toolData.tools || [])].sort((a, b) => {
+    const av = a[toolSortCol] || 0, bv = b[toolSortCol] || 0;
+    return toolSortDir === 'desc' ? bv - av : av - bv;
+  });
+  toolRows = rows;
+  document.querySelectorAll('[id^="tsort-"]').forEach(el => {
+    el.textContent = el.id === 'tsort-' + toolSortCol ? (toolSortDir === 'desc' ? '▼' : '▲') : '';
+  });
+  const body = document.getElementById('tool-body');
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="8" class="chat-empty">No tool calls in this range.</td></tr>';
+    return;
+  }
+  const totalRes = t.result_tokens || 0;
+  const more = document.getElementById('tool-more');
+  more.hidden = rows.length <= TOOL_TOP;
+  more.textContent = toolShowAll ? 'Show top ' + TOOL_TOP : 'Show all ' + rows.length + ' tools';
+  body.innerHTML = (toolShowAll ? rows : rows.slice(0, TOOL_TOP)).map(r => {
+    const share = totalRes > 0 ? r.result_tokens / totalRes * 100 : 0;
+    return '<tr>' +
+      '<td><span class="tool-name">' + esc(r.tool) + '</span></td>' +
+      '<td class="num share-cell" title="' + pct(share) + ' of result tokens">~' + fmt(r.result_tokens) +
+        '<div class="share-bar"><span style="width:' + Math.max(0, Math.min(100, share)).toFixed(2) + '%;background:var(--accent)"></span></div></td>' +
+      '<td class="num">' + fmt(r.calls) + '</td>' +
+      '<td class="num" title="Largest single result: ~' + fmt(r.max_result_tokens) + ' tokens">~' + fmt(r.avg_result_tokens) + '</td>' +
+      '<td class="num">~' + fmt(r.reread_tokens) + '</td>' +
+      '<td class="num">~' + fmt(r.input_tokens) + '</td>' +
+      '<td class="num">' + r.sessions + '</td>' +
+      '<td class="num">' + (r.errors || 0) + '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+function exportToolCSV() {
+  const header = ['Tool', 'Calls', 'Est. Result Tokens', 'Est. Avg Result Tokens', 'Est. Max Result Tokens',
+                  'Est. Re-read Tokens', 'Est. Args Tokens', 'Sessions', 'Errors'];
+  const rows = toolRows.map(r => [r.tool, r.calls, r.result_tokens, r.avg_result_tokens, r.max_result_tokens,
+                                  r.reread_tokens, r.input_tokens, r.sessions, r.errors]);
+  const r = (toolData && toolData.range) || {};
+  downloadCSV('context_by_tool_' + (toolChat ? toolChat.replace(/[^A-Za-z0-9_-]+/g, '-') + '_' : '') +
+              (r.from || 'start') + '_to_' + (r.to || 'now'), header, rows);
 }
 
 function initByChat() {
@@ -2780,6 +2933,19 @@ def get_by_chat_payload(db_path, range_=None, from_=None, to_=None, live_scan=Tr
     return data
 
 
+def get_by_tool_payload(db_path, range_=None, from_=None, to_=None, chat=None, now=None):
+    """Per-tool calls and estimated context tokens over the by-chat range."""
+    if openclaw_attrib is None:
+        return {"error": "OpenClaw attribution module not available"}
+    if not Path(db_path).exists():
+        return {"error": "Database not found. Run: python cli.py scan"}
+    rng = resolve_by_chat_range(range_, from_, to_, now=now)
+    data = openclaw_attrib.get_by_tool_data(db_path, rng["start_utc"], rng["end_utc"], chat=chat or None)
+    data["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data["range"] = rng
+    return data
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -2823,6 +2989,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 (params.get("range") or [None])[0],
                 (params.get("from") or [None])[0],
                 (params.get("to") or [None])[0],
+            )
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif path == "/api/by-tool":
+            # No live scan here: the UI always fetches /api/by-chat alongside.
+            params = parse_qs(urlparse(self.path).query)
+            data = get_by_tool_payload(
+                DB_PATH,
+                (params.get("range") or [None])[0],
+                (params.get("from") or [None])[0],
+                (params.get("to") or [None])[0],
+                (params.get("chat") or [None])[0],
             )
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)

@@ -39,6 +39,7 @@ OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", Path.home() / ".openclaw"))
 
 UNMAPPED_ID = "other:unmapped"
 OUTSIDE_ID = "other:outside-openclaw"
+OUTSIDE_LABEL = "Claude Code on this laptop (not via OpenClaw)"
 
 _SUBAGENT_TASK_MARK = "[Subagent Task]\n"
 _CRON_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)?\[cron:([0-9a-fA-F-]{8,40})")
@@ -374,7 +375,7 @@ def attribute_session(session_id, hint, idx, project_name=None, cwd=None):
     if key:
         return idx.bucket_for_key(key) + (how,)
     if not is_openclaw_project(project_name, cwd):
-        return (OUTSIDE_ID, "Claude Code outside OpenClaw", "outside", "none")
+        return (OUTSIDE_ID, OUTSIDE_LABEL, "outside", "none")
     return (UNMAPPED_ID, "Other / unmapped", "unmapped", "none")
 
 
@@ -513,6 +514,25 @@ def resolve_range(preset=None, from_date=None, to_date=None, tz_name=None, now=N
     }
 
 
+def session_contexts(conn, start_iso=None, end_iso=None):
+    """{session_id: {"context", "last_ts"}} from each session's last main-thread
+    turn in the window: input + cache_read + cache_creation, i.e. how big the
+    prompt was at that point (subagent sidechains have their own context)."""
+    where, params = ["COALESCE(is_subagent, 0) = 0"], []
+    if start_iso:
+        where.append("timestamp >= ?")
+        params.append(start_iso)
+    if end_iso:
+        where.append("timestamp < ?")
+        params.append(end_iso)
+    # SQLite returns the bare columns from the MAX(timestamp) row.
+    sql = ("SELECT session_id, MAX(timestamp), "
+           "COALESCE(input_tokens, 0) + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0) "
+           "FROM turns WHERE " + " AND ".join(where) + " GROUP BY session_id")
+    return {sid: {"context": ctx or 0, "last_ts": ts or ""}
+            for sid, ts, ctx in conn.execute(sql, params)}
+
+
 def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=None):
     """Per-chat token totals for turns with start_iso <= timestamp < end_iso (UTC ISO).
 
@@ -553,6 +573,7 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
         session_ids = sorted({r[0] for r in rows if r[0]})
         refresh_hints(conn, session_ids)
         hints = dict(conn.execute("SELECT session_id, hint FROM openclaw_hints").fetchall())
+        contexts = session_contexts(conn, start_iso, end_iso)
     finally:
         conn.close()
 
@@ -589,8 +610,18 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
             d["tokens"] += (inp or 0) + (out or 0) + (cr or 0) + (cc or 0)
             d["turns"] += turns or 0
             d["sessions"].add(sid)
+    # The laptop bucket is always listed (at zero if need be), so it's clear
+    # direct Claude Code use is tracked, not silently missing.
+    buckets.setdefault(OUTSIDE_ID, {"id": OUTSIDE_ID, "label": OUTSIDE_LABEL, "kind": "outside",
+                                    "sessions": set(), "models": {}})
     out_buckets = []
     for b in buckets.values():
+        ctx = sorted((dict(contexts[s], session_id=s) for s in b["sessions"] if s in contexts),
+                     key=lambda c: c["last_ts"], reverse=True)
+        # Context now = the most recently active session's last main-thread
+        # turn; a long-lived chat keeps re-reading that much as cache on every turn.
+        b["context"] = ctx[0]["context"] if ctx else 0
+        b["context_sessions"] = ctx[:5]
         b["sessions"] = len(b["sessions"])
         out_buckets.append(b)
     out_days = []
@@ -606,3 +637,140 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
     }
     return {"buckets": out_buckets, "days": out_days, "totals": totals,
             "sessions_by_signal": matched}
+
+
+# ── By tool ──────────────────────────────────────────────────────────────────
+#
+# Tools aren't billed on their own. What a tool costs is its result: the text
+# goes into the prompt, and from then on every later turn of that context
+# re-reads it (mostly as cache reads) until the context is compacted or reset.
+# Both numbers below are ESTIMATES from transcript sizes, not API counts.
+
+CHARS_PER_TOKEN = 4       # rough average for English text, code and JSON
+IMAGE_TOKENS = 1600       # a typical screenshot-sized image block
+COMPACTION_DROP = 0.5     # context shrinking below half of the previous turn = compaction/reset
+
+
+def est_tokens(chars, images=0):
+    return int(round((chars or 0) / CHARS_PER_TOKEN)) + (images or 0) * IMAGE_TOKENS
+
+
+def _context_timelines(conn, session_ids, start_iso, end_iso):
+    """{(session_id, agent_id or ''): (turn timestamps, compaction timestamps)}.
+
+    A compaction is a turn whose prompt is less than COMPACTION_DROP of the
+    previous turn's prompt in the same context; results from before it are no
+    longer re-read afterwards.
+    """
+    from collections import defaultdict
+    if not session_ids:
+        return {}
+    where, params = [], []
+    if start_iso:
+        where.append("timestamp >= ?")
+        params.append(start_iso)
+    if end_iso:
+        where.append("timestamp < ?")
+        params.append(end_iso)
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _tool_sids (sid TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM _tool_sids")
+    conn.executemany("INSERT OR IGNORE INTO _tool_sids VALUES (?)", [(s,) for s in session_ids])
+    sql = ("SELECT session_id, COALESCE(agent_id, ''), timestamp, "
+           "COALESCE(input_tokens, 0) + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0) "
+           "FROM turns WHERE session_id IN (SELECT sid FROM _tool_sids)"
+           + (" AND " + " AND ".join(where) if where else "") + " ORDER BY session_id, timestamp")
+    out = defaultdict(lambda: ([], []))
+    prev = {}
+    for sid, aid, ts, ctx in conn.execute(sql, params):
+        key = (sid, aid)
+        times, compactions = out[key]
+        p = prev.get(key)
+        if p and ctx < p * COMPACTION_DROP:
+            compactions.append(ts)
+        prev[key] = ctx
+        times.append(ts)
+    return dict(out)
+
+
+def get_by_tool_data(db_path, start_iso=None, end_iso=None, chat=None, idx=None):
+    """Per-tool call counts and estimated context tokens for calls in the window.
+
+    chat: a bucket id from get_by_chat_data (None = all chats).
+    Per tool: calls, errors, sessions, result_tokens (est. tokens of results
+    added to context), input_tokens (est. tokens of the call arguments, which
+    are model output), and reread_tokens (est. result tokens re-read on later
+    turns of the same context inside the window, stopping at a compaction).
+    """
+    from bisect import bisect_right
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    try:
+        have = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_calls'").fetchone()
+        if not have:
+            return {"tools": [], "chats": [], "totals": {"calls": 0, "result_tokens": 0, "reread_tokens": 0}}
+        where, params = [], []
+        ts_expr = "COALESCE(NULLIF(tc.timestamp, ''), tc.result_ts)"
+        if start_iso:
+            where.append(ts_expr + " >= ?")
+            params.append(start_iso)
+        if end_iso:
+            where.append(ts_expr + " < ?")
+            params.append(end_iso)
+        sql = ("SELECT tc.session_id, COALESCE(tc.agent_id, ''), COALESCE(tc.tool_name, 'unknown'), "
+               "COALESCE(tc.result_ts, " + ts_expr + "), COALESCE(tc.input_chars, 0), "
+               "COALESCE(tc.result_chars, 0), COALESCE(tc.result_images, 0), COALESCE(tc.is_error, 0), "
+               "s.project_name FROM tool_calls tc LEFT JOIN sessions s ON s.session_id = tc.session_id"
+               + (" WHERE " + " AND ".join(where) if where else ""))
+        rows = conn.execute(sql, params).fetchall()
+        session_ids = sorted({r[0] for r in rows if r[0]})
+        refresh_hints(conn, session_ids)
+        hints = dict(conn.execute("SELECT session_id, hint FROM openclaw_hints").fetchall())
+        timelines = _context_timelines(conn, session_ids, start_iso, end_iso)
+    finally:
+        conn.close()
+
+    if idx is None:
+        idx = get_index()
+    attrib = {}
+    chats = {}
+    tools = {}
+    for sid, aid, name, rts, in_chars, res_chars, images, err, project in rows:
+        if sid not in attrib:
+            attrib[sid] = attribute_session(sid, hints.get(sid), idx, project)
+        bid, label, kind, _how = attrib[sid]
+        c = chats.setdefault(bid, {"id": bid, "label": label, "kind": kind, "calls": 0})
+        c["calls"] += 1
+        if chat and bid != chat:
+            continue
+        res_tok = est_tokens(res_chars, images)
+        rereads = 0
+        tl = timelines.get((sid, aid))
+        if tl and rts:
+            times, compactions = tl
+            later = bisect_right(times, rts)
+            stop = len(times)
+            ci = bisect_right(compactions, rts)
+            if ci < len(compactions):
+                stop = bisect_right(times, compactions[ci]) - 1  # the compacting turn no longer carries it
+            # The first later turn reads the result fresh (cache write); the rest re-read it.
+            rereads = max(0, stop - later - 1)
+        t = tools.setdefault(name, {"tool": name, "calls": 0, "errors": 0, "sessions": set(),
+                                    "result_tokens": 0, "input_tokens": 0, "reread_tokens": 0,
+                                    "max_result_tokens": 0})
+        t["calls"] += 1
+        t["errors"] += err
+        t["sessions"].add(sid)
+        t["result_tokens"] += res_tok
+        t["input_tokens"] += est_tokens(in_chars)
+        t["reread_tokens"] += res_tok * rereads
+        t["max_result_tokens"] = max(t["max_result_tokens"], res_tok)
+    out = []
+    for t in tools.values():
+        t["sessions"] = len(t["sessions"])
+        t["avg_result_tokens"] = int(round(t["result_tokens"] / t["calls"])) if t["calls"] else 0
+        out.append(t)
+    out.sort(key=lambda t: t["result_tokens"], reverse=True)
+    totals = {k: sum(t[k] for t in out) for k in ("calls", "result_tokens", "input_tokens", "reread_tokens")}
+    return {"tools": out, "totals": totals,
+            "chats": sorted(chats.values(), key=lambda c: c["calls"], reverse=True),
+            "chat": chat, "estimate": {"chars_per_token": CHARS_PER_TOKEN, "image_tokens": IMAGE_TOKENS}}
