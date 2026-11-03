@@ -229,15 +229,170 @@ class TestByChatData(unittest.TestCase):
             t.start()
             try:
                 port = server.server_address[1]
-                url = "http://127.0.0.1:%d/api/by-chat?from=2026-10-31T13:00:00.000Z&to=bad'input" % port
-                with urllib.request.urlopen(url) as r:
+                base = "http://127.0.0.1:%d/api/by-chat?" % port
+                with urllib.request.urlopen(base + "from=2026-10-31T13:00:00Z&to=bad'input") as r:
                     d = json.loads(r.read())
+                # Sydney dates: 1 Nov AEDT = 31 Oct 13:00Z .. 1 Nov 13:00Z, `to` inclusive.
+                with urllib.request.urlopen(base + "from=2026-11-01&to=2026-11-01") as r:
+                    d2 = json.loads(r.read())
+                with urllib.request.urlopen(base + "range=nonsense&from=2026-99-99") as r:
+                    d3 = json.loads(r.read())
             finally:
                 server.shutdown()
                 server.server_close()
-        self.assertEqual(d["from"], "2026-10-31T13:00:00.000Z")
+        self.assertEqual(d["from"], "2026-10-31T13:00:00.000Z")  # raw instants still work
         self.assertIsNone(d["to"])  # junk range values are dropped
         self.assertIn(CHAN, {b["id"] for b in d["buckets"]})
+        self.assertEqual(d2["range"]["start_utc"], "2026-10-31T13:00:00.000Z")
+        self.assertEqual(d2["range"]["end_utc"], "2026-11-01T13:00:00.000Z")
+        self.assertEqual(d2["totals"]["sessions"], 3)
+        self.assertEqual([x["date"] for x in d2["days"]], ["2026-11-01"])
+        self.assertEqual(d3["range"]["preset"], "all")  # junk -> all time, not an error
+
+
+def _turn(sid, ts, tokens, mid):
+    return {"session_id": sid, "timestamp": ts, "model": "claude-opus-5-5", "input_tokens": tokens,
+            "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0, "tool_name": None,
+            "cwd": "C:/Users/x/.openclaw/workspace", "message_id": mid}
+
+
+class TestRanges(unittest.TestCase):
+    """Range maths: whole Australia/Sydney days, `to` inclusive."""
+
+    def test_sydney_day_bounds_inclusive_to(self):
+        r = oa.resolve_range(None, "2026-10-28", "2026-11-03", tz_name="Australia/Sydney")
+        self.assertEqual(r["start_utc"], "2026-10-27T13:00:00.000Z")  # AEDT, +11
+        self.assertEqual(r["end_utc"], "2026-11-03T13:00:00.000Z")    # end of 3 Nov, not its start
+        r = oa.resolve_range(None, "2026-07-01", "2026-07-01", tz_name="Australia/Sydney")
+        self.assertEqual(r["start_utc"], "2026-06-30T14:00:00.000Z")  # AEST, +10
+        self.assertEqual(r["end_utc"], "2026-07-01T14:00:00.000Z")
+
+    def test_presets_use_local_today(self):
+        from datetime import datetime
+        # 3 Nov 2026 07:50Z is 18:50 in Sydney; 14:00Z is already 4 Nov there.
+        r = oa.resolve_range("7d", now=datetime(2026, 11, 3, 7, 50), tz_name="Australia/Sydney")
+        self.assertEqual((r["from"], r["to"]), ("2026-10-28", "2026-11-03"))
+        c = oa.resolve_range(None, "2026-10-28", "2026-11-03", tz_name="Australia/Sydney")
+        self.assertEqual((r["start_utc"], r["end_utc"]), (c["start_utc"], c["end_utc"]))
+        r = oa.resolve_range("today", now=datetime(2026, 11, 3, 14, 0), tz_name="Australia/Sydney")
+        self.assertEqual((r["from"], r["to"]), ("2026-11-04", "2026-11-04"))
+
+    def test_reversed_and_open_ranges(self):
+        r = oa.resolve_range(None, "2026-11-03", "2026-10-28")
+        self.assertEqual((r["from"], r["to"]), ("2026-10-28", "2026-11-03"))
+        r = oa.resolve_range(None, None, "2026-11-03")
+        self.assertIsNone(r["start_utc"])
+        self.assertEqual(r["preset"], "custom")
+        self.assertEqual(oa.resolve_range()["preset"], "all")
+
+    def test_sydney_fallback_matches_zoneinfo(self):
+        from datetime import date, datetime, timedelta
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo("Australia/Sydney")
+        except Exception:
+            self.skipTest("no tzdata to compare against")
+        fb = oa._SydneyFallback()
+        day = date(2025, 1, 1)
+        while day.year < 2028:
+            m = datetime(day.year, day.month, day.day)
+            self.assertEqual(oa._local_midnight_utc(day, "Australia/Sydney"),
+                             m - fb.offset(m - timedelta(hours=10)), day)
+            day += timedelta(days=1)
+
+    def test_boundary_format_keeps_turn_on_the_edge(self):
+        self.assertLess("2026-10-27T13:00:00.000Z", "2026-10-27T13:00:00Z")  # why utc_iso pads .000
+        self.assertEqual(oa.local_day("2026-10-27T12:59:59.999Z", "Australia/Sydney"), "2026-10-27")
+        self.assertEqual(oa.local_day("2026-10-27T13:00:00.000Z", "Australia/Sydney"), "2026-10-28")
+
+
+class TestRangeAggregation(unittest.TestCase):
+    """A long-lived session spanning range edges is split per turn."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = os.path.join(self.tmp, "openclaw")
+        os.makedirs(self.home)
+        make_openclaw_home(self.home)
+        self.idx = oa.load_index(self.home)
+        self.db_path = Path(self.tmp) / "usage.db"
+        conn = get_db(self.db_path)
+        init_db(conn)
+        # cli-chan: one channel session from 27 Oct to 4 Nov (Sydney), like #ai-dashboard.
+        # cli-main: two turns on 28 Oct. cron-a / cron-b: one automation run each.
+        turns = [
+            _turn("cli-chan", "2026-10-26T13:00:00.000Z", 1000, "c1"),   # 27 Oct 00:00 Sydney
+            _turn("cli-chan", "2026-10-27T12:59:59.999Z", 2000, "c2"),   # 27 Oct 23:59 Sydney
+            _turn("cli-chan", "2026-10-27T13:00:00.000Z", 30, "c3"),     # 28 Oct 00:00 Sydney
+            _turn("cli-chan", "2026-11-03T07:00:00.000Z", 400, "c4"),    # 3 Nov 18:00 Sydney
+            _turn("cli-chan", "2026-11-03T13:00:00.000Z", 50000, "c5"),  # 4 Nov 00:00 Sydney
+            _turn("cli-main", "2026-10-28T01:00:00.000Z", 5, "m1"),
+            _turn("cli-main", "2026-10-28T02:00:00.000Z", 5, "m2"),
+            _turn("cron-a", "2026-10-29T00:00:00.000Z", 7, "a1"),
+            _turn("cron-b", "2026-11-02T00:00:00.000Z", 9, "b1"),
+        ]
+        # Session-level timestamps deliberately say "27 Oct" only: they must not matter.
+        sessions = [{"session_id": sid, "project_name": ".openclaw/workspace",
+                     "first_timestamp": "2026-10-26T13:00:00Z", "last_timestamp": "2026-10-26T13:00:00Z",
+                     "git_branch": "", "model": "claude-opus-5-5", "total_input_tokens": 0,
+                     "total_output_tokens": 0, "total_cache_read": 0, "total_cache_creation": 0,
+                     "turn_count": 1} for sid in ("cli-chan", "cli-main", "cron-a", "cron-b")]
+        upsert_sessions(conn, sessions)
+        insert_turns(conn, turns)
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def data(self, f, t):
+        r = oa.resolve_range(None, f, t, tz_name="Australia/Sydney")
+        return oa.get_by_chat_data(self.db_path, r["start_utc"], r["end_utc"], idx=self.idx,
+                                   tz_name="Australia/Sydney")
+
+    def chan_tokens(self, d):
+        b = {x["id"]: x for x in d["buckets"]}.get(CHAN)
+        return b["models"]["claude-opus-5-5"]["input"] if b else 0
+
+    def test_session_spanning_boundary_is_split(self):
+        self.assertEqual(self.chan_tokens(self.data("2026-10-27", "2026-10-27")), 3000)
+        self.assertEqual(self.chan_tokens(self.data("2026-10-28", "2026-11-03")), 430)
+        self.assertEqual(self.chan_tokens(self.data("2026-11-04", "2026-11-04")), 50000)
+
+    def test_adjacent_ranges_add_up(self):
+        a = self.data("2026-10-27", "2026-10-30")
+        b = self.data("2026-10-31", "2026-11-04")
+        both = self.data("2026-10-27", "2026-11-04")
+        self.assertEqual(a["totals"]["tokens"] + b["totals"]["tokens"], both["totals"]["tokens"])
+        self.assertEqual(both["totals"]["tokens"], 53456)
+        self.assertEqual(self.chan_tokens(a) + self.chan_tokens(b), self.chan_tokens(both))
+        # Daily totals add up to the range total, on Sydney days inside the range.
+        self.assertEqual(sum(d["tokens"] for d in both["days"]), both["totals"]["tokens"])
+        self.assertEqual([d["date"] for d in both["days"]],
+                         ["2026-10-27", "2026-10-28", "2026-10-29", "2026-11-02", "2026-11-03", "2026-11-04"])
+
+    def test_sessions_are_distinct_sessions_active_in_range(self):
+        d = self.data("2026-10-28", "2026-11-03")
+        self.assertEqual(d["totals"]["sessions"], 4)  # chan, main, cron-a, cron-b
+        by_id = {b["id"]: b for b in d["buckets"]}
+        self.assertEqual(by_id[CHAN]["sessions"], 1)  # two turns in range, still one session
+        self.assertEqual(self.data("2026-10-27", "2026-10-27")["totals"]["sessions"], 1)
+        empty = self.data("2026-10-30", "2026-11-01")
+        self.assertEqual((empty["totals"]["sessions"], empty["buckets"]), (0, []))
+        day28 = self.data("2026-10-28", "2026-10-28")["days"]
+        self.assertEqual([(x["date"], x["sessions"], x["turns"], x["tokens"]) for x in day28],
+                         [("2026-10-28", 2, 3, 40)])
+
+    def test_ui_preset_and_api_dates_agree(self):
+        import dashboard
+        from datetime import datetime
+        now = datetime(2026, 11, 3, 7, 50)
+        with mock.patch.object(oa, "get_index", lambda *a, **k: self.idx):
+            p = dashboard.get_by_chat_payload(self.db_path, "7d", live_scan=False, now=now)
+            c = dashboard.get_by_chat_payload(self.db_path, None, "2026-10-28", "2026-11-03", live_scan=False)
+        self.assertEqual(p["totals"], c["totals"])
+        self.assertEqual(p["range"]["start_utc"], c["range"]["start_utc"])
+        self.assertEqual(p["totals"]["tokens"], 430 + 10 + 7 + 9)
 
 
 if __name__ == "__main__":

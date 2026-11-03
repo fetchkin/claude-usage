@@ -605,7 +605,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div class="container">
   <div class="stats-row" id="stats-row"></div>
   <div class="table-card" id="sec-by-chat" data-card="by-chat">
-    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Cost by Chat <span class="info-icon" tabindex="0" role="img" aria-label="About this section" title="Which OpenClaw chat ran each Claude session: Slack channels (threads included), the main DM, and scheduled automations. Subagent workers count toward the chat that spawned them. Has its own date range; the Models filter above still applies. Refreshes every 30s."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportChatCSV()" title="Export the per-chat breakdown to CSV">&#x2913; CSV</button></div>
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Cost by Chat <span class="info-icon" tabindex="0" role="img" aria-label="About this section" title="Which OpenClaw chat ran each Claude session: Slack channels (threads included), the main DM, and scheduled automations. Subagent workers count toward the chat that spawned them. Has its own date range in whole Australia/Sydney days (end date included), counted per turn; the Models filter above still applies. Refreshes every 30s."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportChatCSV()" title="Export the per-chat breakdown to CSV">&#x2913; CSV</button></div>
     <div class="chat-controls">
       <div class="tz-group" id="chat-presets" role="group" aria-label="Chat date range">
         <button class="tz-btn" data-preset="today" onclick="setChatPreset('today')">Today</button>
@@ -644,7 +644,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <th class="sortable" onclick="setChatSort('output')">Output <span class="sort-icon" id="csort-output"></span></th>
             <th class="sortable" onclick="setChatSort('cache_read')">Cache Read <span class="sort-icon" id="csort-cache_read"></span></th>
             <th class="sortable" onclick="setChatSort('cache_creation')">Cache Write <span class="sort-icon" id="csort-cache_creation"></span></th>
-            <th class="sortable" onclick="setChatSort('sessions')">Sessions <span class="sort-icon" id="csort-sessions"></span></th>
+            <th class="sortable" onclick="setChatSort('sessions')" title="Distinct Claude Code sessions (transcripts) with at least one turn in this range. A channel reuses one session until it resets; every automation run and every subagent worker is its own session.">Sessions <span class="sort-icon" id="csort-sessions"></span></th>
           </tr></thead>
           <tbody id="chat-body"></tbody>
         </table>
@@ -2252,9 +2252,16 @@ function setChatSort(col) {
 
 async function loadByChat() {
   const seq = ++chatReqSeq;
-  const { from, to } = chatRangeBounds();
-  const q = new URLSearchParams({ from: from.toISOString() });
-  if (to) q.set('to', to.toISOString());
+  // The server owns the range maths (whole Australia/Sydney days, `to`
+  // inclusive), so the presets, custom dates, CSV and raw API all agree.
+  const q = new URLSearchParams();
+  if (chatPreset === 'custom') {
+    const { from, to } = chatRangeBounds();
+    q.set('from', localISODate(from));
+    if (to) q.set('to', localISODate(addDays(to, -1)));
+  } else {
+    q.set('range', chatPreset);
+  }
   const live = document.getElementById('chat-live');
   try {
     const resp = await fetch('/api/by-chat?' + q.toString());
@@ -2272,12 +2279,21 @@ async function loadByChat() {
       live.classList.remove('pulse'); void live.offsetWidth; live.classList.add('pulse');
     }
     document.getElementById('chat-live-text').textContent =
-      'Live · ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      chatRangeLabel(d.range) + ' · Live ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   } catch (e) {
     console.error(e);
     if (live) live.classList.add('stale');
     document.getElementById('chat-live-text').textContent = 'Offline — retrying';
   }
+}
+
+// "28 Oct – 3 Nov (Sydney)" from the range the server actually applied.
+function chatRangeLabel(r) {
+  if (!r || (!r.from && !r.to)) return 'All time';
+  const f = d => { const x = parseLocalDate(d); return x ? x.toLocaleDateString([], { day: 'numeric', month: 'short' }) : d; };
+  const tz = r.tz === 'UTC' ? 'UTC' : (r.tz || '').split('/').pop().replace(/_/g, ' ');
+  const span = r.from === r.to ? f(r.from) : (r.from ? f(r.from) : '…') + ' – ' + (r.to ? f(r.to) : 'now');
+  return span + (tz ? ' (' + tz + ')' : '');
 }
 
 function scheduleChatRefresh() {
@@ -2434,7 +2450,8 @@ function exportChatCSV() {
   const header = ['Chat', 'Kind', 'Share % (' + chatBasis + ')', 'Est. Cost', 'Total Tokens', 'Input', 'Output', 'Cache Read', 'Cache Write', 'Sessions'];
   const rows = chatRows.map(r => [r.label, r.kind, r.share.toFixed(2), r.cost.toFixed(4), r.tokens,
                                   r.input, r.output, r.cache_read, r.cache_creation, r.sessions]);
-  downloadCSV('cost_by_chat', header, rows);
+  const r = (chatData && chatData.range) || {};
+  downloadCSV('cost_by_chat_' + (r.from || 'start') + '_to_' + (r.to || 'now'), header, rows);
 }
 
 function initByChat() {
@@ -2690,14 +2707,33 @@ def find_icon_file():
     return None
 
 
-_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z?)?$")
+_INSTANT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z?$")
 
 
-def _clean_iso(value):
-    """Accept only plain ISO dates/instants for the by-chat range (anything else -> None)."""
-    if value and _ISO_RE.match(value):
-        return value
-    return None
+def _clean_instant(value):
+    """A raw UTC instant ('2026-10-31T13:00:00Z') -> transcript-style ISO, else None."""
+    if not value or not _INSTANT_RE.match(value):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.rstrip("Z"))
+    except ValueError:
+        return None
+    return openclaw_attrib.utc_iso(dt)
+
+
+def resolve_by_chat_range(range_=None, from_=None, to_=None, now=None):
+    """The single source of truth for by-chat date ranges (UI, CSV and API).
+
+    `range` = today | 7d | 30d, or `from` / `to` as inclusive local dates
+    (YYYY-MM-DD, Australia/Sydney by default). Raw UTC instants are still
+    accepted for scripts, as a half-open [from, to) window. Anything else is
+    dropped.
+    """
+    if (from_ and "T" in from_) or (to_ and "T" in to_):
+        start, end = _clean_instant(from_), _clean_instant(to_)
+        return {"preset": "custom" if (start or end) else "all", "from": start, "to": end,
+                "tz": "UTC", "start_utc": start, "end_utc": end}
+    return openclaw_attrib.resolve_range(range_, from_, to_, now=now)
 
 
 # Live counters: each /api/by-chat poll kicks off an incremental scan (at most
@@ -2728,16 +2764,19 @@ def _maybe_live_scan(db_path):
     threading.Thread(target=run, daemon=True).start()
 
 
-def get_by_chat_payload(db_path, start_iso=None, end_iso=None, live_scan=True):
+def get_by_chat_payload(db_path, range_=None, from_=None, to_=None, live_scan=True, now=None):
     if openclaw_attrib is None:
         return {"error": "OpenClaw attribution module not available"}
     if not Path(db_path).exists():
         return {"error": "Database not found. Run: python cli.py scan"}
     if live_scan:
         _maybe_live_scan(db_path)
-    data = openclaw_attrib.get_by_chat_data(db_path, start_iso, end_iso)
+    rng = resolve_by_chat_range(range_, from_, to_, now=now)
+    data = openclaw_attrib.get_by_chat_data(db_path, rng["start_utc"], rng["end_utc"],
+                                            tz_name=None if rng["tz"] == "UTC" else rng["tz"])
     data["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    data["from"], data["to"] = start_iso, end_iso
+    data["range"] = rng
+    data["from"], data["to"] = rng["from"], rng["to"]
     return data
 
 
@@ -2781,8 +2820,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             params = parse_qs(urlparse(self.path).query)
             data = get_by_chat_payload(
                 DB_PATH,
-                _clean_iso((params.get("from") or [None])[0]),
-                _clean_iso((params.get("to") or [None])[0]),
+                (params.get("range") or [None])[0],
+                (params.get("from") or [None])[0],
+                (params.get("to") or [None])[0],
             )
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)

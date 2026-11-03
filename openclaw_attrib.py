@@ -393,12 +393,140 @@ def get_index(max_age=20.0, openclaw_home=None):
         return _index_cache["idx"]
 
 
-def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None):
+# ── Date ranges (local-calendar days, default Australia/Sydney) ──────────────
+#
+# Every by-chat range is a run of whole local days: `from` and `to` are
+# inclusive YYYY-MM-DD dates in RANGE_TZ, turned into a half-open UTC window
+# [from 00:00 local, day after `to` 00:00 local). Presets resolve to dates the
+# same way, so the UI, the CSV (built from the same payload) and the raw API
+# all go through resolve_range().
+
+RANGE_TZ = os.environ.get("CLAUDE_USAGE_TZ", "Australia/Sydney")
+RANGE_PRESETS = {"today": 1, "7d": 7, "30d": 30}
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _first_sunday(year, month):
+    from datetime import date, timedelta
+    d = date(year, month, 1)
+    return d + timedelta(days=(6 - d.weekday()) % 7)
+
+
+class _SydneyFallback:
+    """Australia/Sydney rules for Pythons without tzdata (3.8, bare Windows).
+
+    AEDT (+11) from the first Sunday of October 02:00 AEST to the first Sunday
+    of April 03:00 AEDT; both instants are 16:00 UTC the day before.
+    """
+
+    def offset(self, utc_naive):
+        from datetime import datetime, timedelta
+        y = utc_naive.year
+        start = datetime.combine(_first_sunday(y, 10), datetime.min.time()) - timedelta(hours=8)
+        end = datetime.combine(_first_sunday(y, 4), datetime.min.time()) - timedelta(hours=8)
+        return timedelta(hours=11 if (utc_naive >= start or utc_naive < end) else 10)
+
+
+def _zone(tz_name):
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(tz_name)
+    except Exception:
+        if tz_name == "Australia/Sydney":
+            return _SydneyFallback()
+        raise
+
+
+def _utc_to_local(utc_naive, tz_name):
+    """Naive UTC datetime -> naive local datetime in tz_name."""
+    from datetime import timezone
+    z = _zone(tz_name)
+    if isinstance(z, _SydneyFallback):
+        return utc_naive + z.offset(utc_naive)
+    return utc_naive.replace(tzinfo=timezone.utc).astimezone(z).replace(tzinfo=None)
+
+
+def _local_midnight_utc(day, tz_name):
+    """Naive UTC instant of 00:00 local time on `day`."""
+    from datetime import datetime, timedelta, timezone
+    z = _zone(tz_name)
+    naive = datetime(day.year, day.month, day.day)
+    if isinstance(z, _SydneyFallback):
+        # Sydney midnight is never inside a transition hour, so one estimate is exact.
+        return naive - z.offset(naive - timedelta(hours=10))
+    return naive.replace(tzinfo=z).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def utc_iso(dt):
+    """Format a naive UTC datetime like transcript timestamps (2026-11-03T07:50:10.050Z).
+
+    Turns are compared as strings, so a bound must use the same layout: a bare
+    '...:00Z' sorts after '...:00.000Z' and would drop a turn on the boundary.
+    """
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (dt.microsecond // 1000)
+
+
+def local_day(utc_ts, tz_name=None):
+    """Local calendar date (YYYY-MM-DD) of a transcript UTC timestamp."""
+    from datetime import datetime
+    dt = datetime.fromisoformat(utc_ts.replace("Z", "+00:00")).replace(tzinfo=None)
+    return _utc_to_local(dt, tz_name or RANGE_TZ).strftime("%Y-%m-%d")
+
+
+def _parse_date(value):
+    from datetime import date
+    if not value or not _DATE_RE.match(value):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def resolve_range(preset=None, from_date=None, to_date=None, tz_name=None, now=None):
+    """Resolve a by-chat range to whole local days.
+
+    preset: "today" | "7d" | "30d" (ending today, local time), else custom/all.
+    from_date / to_date: inclusive YYYY-MM-DD local dates; either may be open.
+    now: naive UTC datetime (tests). Returns {"preset", "from", "to", "tz",
+    "start_utc", "end_utc"}, with None for an open side.
+    """
+    from datetime import datetime, timedelta, timezone
+    tz_name = tz_name or RANGE_TZ
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    f = t = None
+    if preset in RANGE_PRESETS:
+        t = _utc_to_local(now, tz_name).date()
+        f = t - timedelta(days=RANGE_PRESETS[preset] - 1)
+    else:
+        f, t = _parse_date(from_date), _parse_date(to_date)
+        if f and t and t < f:
+            f, t = t, f
+        preset = "custom" if (f or t) else "all"
+    return {
+        "preset": preset,
+        "from": f.isoformat() if f else None,
+        "to": t.isoformat() if t else None,
+        "tz": tz_name,
+        "start_utc": utc_iso(_local_midnight_utc(f, tz_name)) if f else None,
+        "end_utc": utc_iso(_local_midnight_utc(t + timedelta(days=1), tz_name)) if t else None,
+    }
+
+
+def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=None):
     """Per-chat token totals for turns with start_iso <= timestamp < end_iso (UTC ISO).
 
-    Returns {"buckets": [{id, label, kind, sessions, models: {model: {...}}}], ...}.
-    Costs are computed client-side per model with the dashboard's PRICING.
+    Filtering is per turn (each assistant message's own timestamp), so a
+    long-lived chat session only contributes its turns inside the window, and
+    a bucket's `sessions` is the number of distinct Claude sessions with at
+    least one turn in the window.
+
+    Returns {"buckets": [{id, label, kind, sessions, models: {model: {...}}}],
+    "days": [{date, tokens, turns, sessions}], "totals": {...}, ...}; `days`
+    are local calendar days in tz_name. Costs are computed client-side per
+    model with the dashboard's PRICING.
     """
+    tz_name = tz_name or RANGE_TZ
     conn = sqlite3.connect(db_path, timeout=10)
     conn.execute("PRAGMA busy_timeout = 5000")
     try:
@@ -409,14 +537,17 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None):
         if end_iso:
             where.append("t.timestamp < ?")
             params.append(end_iso)
+        # Also grouped by UTC hour: tz offsets here are whole hours, so each
+        # row falls on exactly one local day for the per-day totals.
         sql = """
             SELECT t.session_id, COALESCE(NULLIF(t.model, ''), 'unknown') AS turn_model,
+                   substr(t.timestamp, 1, 13) AS hour,
                    SUM(t.input_tokens), SUM(t.output_tokens),
                    SUM(t.cache_read_tokens), SUM(t.cache_creation_tokens), COUNT(*),
                    MAX(s.project_name), MAX(t.cwd)
             FROM turns t LEFT JOIN sessions s ON s.session_id = t.session_id
         """ + (" WHERE " + " AND ".join(where) if where else "") + """
-            GROUP BY t.session_id, turn_model
+            GROUP BY t.session_id, turn_model, hour
         """
         rows = conn.execute(sql, params).fetchall()
         session_ids = sorted({r[0] for r in rows if r[0]})
@@ -428,9 +559,11 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None):
     if idx is None:
         idx = get_index()
     buckets = {}
+    days = {}
     matched = {"binding": 0, "marker": 0, "none": 0}
     cache = {}
-    for sid, model, inp, out, cr, cc, turns, project, cwd in rows:
+    day_of_hour = {}
+    for sid, model, hour, inp, out, cr, cc, turns, project, cwd in rows:
         if sid not in cache:
             cache[sid] = attribute_session(sid, hints.get(sid), idx, project, cwd)
             matched[cache[sid][3]] += 1
@@ -445,8 +578,31 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None):
         m["cache_read"] += cr or 0
         m["cache_creation"] += cc or 0
         m["turns"] += turns or 0
+        if hour not in day_of_hour:
+            try:
+                day_of_hour[hour] = local_day(hour + ":00:00Z", tz_name)
+            except (TypeError, ValueError):
+                day_of_hour[hour] = None
+        dk = day_of_hour[hour]
+        if dk:
+            d = days.setdefault(dk, {"date": dk, "tokens": 0, "turns": 0, "sessions": set()})
+            d["tokens"] += (inp or 0) + (out or 0) + (cr or 0) + (cc or 0)
+            d["turns"] += turns or 0
+            d["sessions"].add(sid)
     out_buckets = []
     for b in buckets.values():
         b["sessions"] = len(b["sessions"])
         out_buckets.append(b)
-    return {"buckets": out_buckets, "sessions_by_signal": matched}
+    out_days = []
+    for dk in sorted(days):
+        d = days[dk]
+        d["sessions"] = len(d["sessions"])
+        out_days.append(d)
+    totals = {
+        "tokens": sum(sum(m["input"] + m["output"] + m["cache_read"] + m["cache_creation"]
+                          for m in b["models"].values()) for b in out_buckets),
+        "turns": sum(sum(m["turns"] for m in b["models"].values()) for b in out_buckets),
+        "sessions": len(cache),
+    }
+    return {"buckets": out_buckets, "days": out_days, "totals": totals,
+            "sessions_by_signal": matched}
