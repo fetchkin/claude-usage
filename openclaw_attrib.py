@@ -542,8 +542,10 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
     least one turn in the window.
 
     Returns {"buckets": [{id, label, kind, sessions, models: {model: {...}}}],
-    "days": [{date, tokens, turns, sessions}], "totals": {...}, ...}; `days`
-    are local calendar days in tz_name. Costs are computed client-side per
+    "days": [{date, tokens, turns, sessions}], "hours": [...], "totals": {...}, ...};
+    `days` are local calendar days in tz_name. `hours` are local hours
+    (YYYY-MM-DDTHH) split by interface ("openclaw" or "outside", i.e. Claude
+    Code used directly) and model, with the same token fields as a bucket model. Costs are computed client-side per
     model with the dashboard's PRICING.
     """
     tz_name = tz_name or RANGE_TZ
@@ -584,6 +586,8 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
     matched = {"binding": 0, "marker": 0, "none": 0}
     cache = {}
     day_of_hour = {}
+    hours = {}
+    local_hour = {}
     for sid, model, hour, inp, out, cr, cc, turns, project, cwd in rows:
         if sid not in cache:
             cache[sid] = attribute_session(sid, hints.get(sid), idx, project, cwd)
@@ -610,6 +614,23 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
             d["tokens"] += (inp or 0) + (out or 0) + (cr or 0) + (cc or 0)
             d["turns"] += turns or 0
             d["sessions"].add(sid)
+        if hour not in local_hour:
+            try:
+                from datetime import datetime
+                local_hour[hour] = _utc_to_local(datetime.fromisoformat(hour + ":00:00"), tz_name).strftime("%Y-%m-%dT%H")
+            except (TypeError, ValueError):
+                local_hour[hour] = None
+        lh = local_hour[hour]
+        if lh:
+            iface = "outside" if kind == "outside" else "openclaw"
+            h = hours.setdefault((lh, iface, model), {"hour": lh, "interface": iface, "model": model,
+                                                       "input": 0, "output": 0, "cache_read": 0,
+                                                       "cache_creation": 0, "turns": 0})
+            h["input"] += inp or 0
+            h["output"] += out or 0
+            h["cache_read"] += cr or 0
+            h["cache_creation"] += cc or 0
+            h["turns"] += turns or 0
     # The laptop bucket is always listed (at zero if need be), so it's clear
     # direct Claude Code use is tracked, not silently missing.
     buckets.setdefault(OUTSIDE_ID, {"id": OUTSIDE_ID, "label": OUTSIDE_LABEL, "kind": "outside",
@@ -635,7 +656,8 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
         "turns": sum(sum(m["turns"] for m in b["models"].values()) for b in out_buckets),
         "sessions": len(cache),
     }
-    return {"buckets": out_buckets, "days": out_days, "totals": totals,
+    out_hours = [hours[k] for k in sorted(hours)]
+    return {"buckets": out_buckets, "days": out_days, "hours": out_hours, "totals": totals,
             "sessions_by_signal": matched}
 
 
