@@ -35,6 +35,11 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    import device_ingest
+except ImportError:  # pragma: no cover
+    device_ingest = None
+
 OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", Path.home() / ".openclaw"))
 
 UNMAPPED_ID = "other:unmapped"
@@ -533,6 +538,10 @@ def session_contexts(conn, start_iso=None, end_iso=None):
             for sid, ts, ctx in conn.execute(sql, params)}
 
 
+LOCAL_DEVICE = "this-laptop"
+LOCAL_DEVICE_LABEL = "This laptop"
+
+
 def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=None):
     """Per-chat token totals for turns with start_iso <= timestamp < end_iso (UTC ISO).
 
@@ -544,8 +553,14 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
     Returns {"buckets": [{id, label, kind, sessions, models: {model: {...}}}],
     "days": [{date, tokens, turns, sessions}], "hours": [...], "totals": {...}, ...};
     `days` are local calendar days in tz_name. `hours` are local hours
-    (YYYY-MM-DDTHH) split by interface ("openclaw" or "outside", i.e. Claude
-    Code used directly) and model, with the same token fields as a bucket model. Costs are computed client-side per
+    (YYYY-MM-DDTHH) split by device, interface ("openclaw" or "outside", i.e.
+    Claude Code used directly) and model, with the same token fields as a
+    bucket model.
+
+    Usage pushed by other machines (device_ingest) is merged in: one bucket
+    per device + project folder (kind "device", e.g. "Tam's Mac - Claude Code
+    - vault"), counted as "outside" in `hours`, and in days/totals. `devices`
+    summarises every device (this laptop first) with its per-model tokens. Costs are computed client-side per
     model with the dashboard's PRICING.
     """
     tz_name = tz_name or RANGE_TZ
@@ -576,6 +591,10 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
         refresh_hints(conn, session_ids)
         hints = dict(conn.execute("SELECT session_id, hint FROM openclaw_hints").fetchall())
         contexts = session_contexts(conn, start_iso, end_iso)
+        remote, remote_devices = [], []
+        if device_ingest is not None:
+            remote = device_ingest.remote_rows(conn, start_iso, end_iso)
+            remote_devices = device_ingest.device_list(conn)
     finally:
         conn.close()
 
@@ -588,6 +607,25 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
     day_of_hour = {}
     hours = {}
     local_hour = {}
+    dev_models = {}
+
+    def add_model(device, model, inp, out, cr, cc, turns):
+        m = dev_models.setdefault(device, {}).setdefault(model, {"input": 0, "output": 0, "cache_read": 0,
+                                                                  "cache_creation": 0, "turns": 0})
+        m["input"] += inp or 0
+        m["output"] += out or 0
+        m["cache_read"] += cr or 0
+        m["cache_creation"] += cc or 0
+        m["turns"] += turns or 0
+
+    def to_local_hour(hour):
+        if hour not in local_hour:
+            try:
+                from datetime import datetime
+                local_hour[hour] = _utc_to_local(datetime.fromisoformat(hour + ":00:00"), tz_name).strftime("%Y-%m-%dT%H")
+            except (TypeError, ValueError):
+                local_hour[hour] = None
+        return local_hour[hour]
     for sid, model, hour, inp, out, cr, cc, turns, project, cwd in rows:
         if sid not in cache:
             cache[sid] = attribute_session(sid, hints.get(sid), idx, project, cwd)
@@ -614,18 +652,45 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
             d["tokens"] += (inp or 0) + (out or 0) + (cr or 0) + (cc or 0)
             d["turns"] += turns or 0
             d["sessions"].add(sid)
-        if hour not in local_hour:
-            try:
-                from datetime import datetime
-                local_hour[hour] = _utc_to_local(datetime.fromisoformat(hour + ":00:00"), tz_name).strftime("%Y-%m-%dT%H")
-            except (TypeError, ValueError):
-                local_hour[hour] = None
-        lh = local_hour[hour]
+        lh = to_local_hour(hour)
+        add_model(LOCAL_DEVICE, model, inp, out, cr, cc, turns)
         if lh:
             iface = "outside" if kind == "outside" else "openclaw"
-            h = hours.setdefault((lh, iface, model), {"hour": lh, "interface": iface, "model": model,
-                                                       "input": 0, "output": 0, "cache_read": 0,
-                                                       "cache_creation": 0, "turns": 0})
+            h = hours.setdefault((lh, LOCAL_DEVICE, iface, model), {"hour": lh, "device": LOCAL_DEVICE, "interface": iface,
+                                                                     "model": model, "input": 0, "output": 0, "cache_read": 0,
+                                                                     "cache_creation": 0, "turns": 0})
+            h["input"] += inp or 0
+            h["output"] += out or 0
+            h["cache_read"] += cr or 0
+            h["cache_creation"] += cc or 0
+            h["turns"] += turns or 0
+    # Other machines' pushed totals: one bucket per device + project folder.
+    labels = {d["device"]: d["label"] for d in remote_devices}
+    remote_sessions = set()
+    for device, dlabel, hour, model, project, session, inp, out, cr, cc, turns in remote:
+        bid = "device:%s:%s" % (device, project)
+        b = buckets.setdefault(bid, {"id": bid, "label": "%s \u2014 Claude Code \u00b7 %s" % (dlabel, project),
+                                     "kind": "device", "device": device, "sessions": set(), "models": {}})
+        sk = (device, session)
+        b["sessions"].add(sk)
+        remote_sessions.add(sk)
+        m = b["models"].setdefault(model, {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "turns": 0})
+        m["input"] += inp or 0
+        m["output"] += out or 0
+        m["cache_read"] += cr or 0
+        m["cache_creation"] += cc or 0
+        m["turns"] += turns or 0
+        add_model(device, model, inp, out, cr, cc, turns)
+        lh = to_local_hour(hour)
+        if lh:
+            dk = lh[:10]
+            d = days.setdefault(dk, {"date": dk, "tokens": 0, "turns": 0, "sessions": set()})
+            d["tokens"] += (inp or 0) + (out or 0) + (cr or 0) + (cc or 0)
+            d["turns"] += turns or 0
+            d["sessions"].add(sk)
+            h = hours.setdefault((lh, device, "outside", model), {"hour": lh, "device": device, "interface": "outside",
+                                                                   "model": model, "input": 0, "output": 0, "cache_read": 0,
+                                                                   "cache_creation": 0, "turns": 0})
             h["input"] += inp or 0
             h["output"] += out or 0
             h["cache_read"] += cr or 0
@@ -654,10 +719,14 @@ def get_by_chat_data(db_path, start_iso=None, end_iso=None, idx=None, tz_name=No
         "tokens": sum(sum(m["input"] + m["output"] + m["cache_read"] + m["cache_creation"]
                           for m in b["models"].values()) for b in out_buckets),
         "turns": sum(sum(m["turns"] for m in b["models"].values()) for b in out_buckets),
-        "sessions": len(cache),
+        "sessions": len(cache) + len(remote_sessions),
     }
+    devices = [{"device": LOCAL_DEVICE, "label": LOCAL_DEVICE_LABEL, "local": True, "last_push": None,
+                "models": dev_models.get(LOCAL_DEVICE, {})}]
+    devices += [{"device": d["device"], "label": d["label"], "local": False, "last_push": d["last_push"],
+                 "models": dev_models.get(d["device"], {})} for d in remote_devices]
     out_hours = [hours[k] for k in sorted(hours)]
-    return {"buckets": out_buckets, "days": out_days, "hours": out_hours, "totals": totals,
+    return {"buckets": out_buckets, "days": out_days, "hours": out_hours, "devices": devices, "totals": totals,
             "sessions_by_signal": matched}
 
 
