@@ -14,6 +14,7 @@ from pathlib import Path
 from datetime import datetime
 
 from scanner import VERSION, init_db
+import device_ingest
 
 try:  # Fetchkin fork: per-chat attribution for OpenClaw. Not bundled in the .vsix.
     import openclaw_attrib
@@ -21,6 +22,9 @@ except ImportError:  # pragma: no cover
     openclaw_attrib = None
 
 DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usage.db"))
+COLLECTOR_DIR = Path(__file__).resolve().parent / "collector"
+COLLECTOR_FILES = {"claude_usage_collector.py", "install-mac.sh", "install-windows.ps1"}
+INGEST_MAX_BYTES = 32 * 2**20
 
 # Which surface is rendering the dashboard: "web" (standalone `cli.py dashboard`)
 # or "vscode" (embedded in the extension's sidebar webview). serve() sets this
@@ -2505,7 +2509,7 @@ function buildChatRows(buckets) {
 
 function chatValue(r) { return chatBasis === 'cost' ? r.cost : r.tokens; }
 function pct(x) { return x >= 10 ? x.toFixed(0) + '%' : x >= 0.1 ? x.toFixed(1) + '%' : x > 0 ? '<0.1%' : '0%'; }
-const CHAT_KIND_LABEL = { channel: 'channel', dm: 'DM', cron: 'automation', unmapped: '', outside: '', other: '' };
+const CHAT_KIND_LABEL = { channel: 'channel', dm: 'DM', cron: 'automation', unmapped: '', outside: '', other: '', device: 'other device' };
 
 // Ease the headline totals up to their new value so the counters visibly tick.
 function tweenTo(el, key, target, format) {
@@ -3153,6 +3157,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        elif path.startswith("/collector/"):
+            # The collector and its installers (no secrets in them), so another
+            # machine on the tailnet can `curl ... | sh` the setup.
+            name = path[len("/collector/"):]
+            f = COLLECTOR_DIR / name
+            if name not in COLLECTOR_FILES or not f.is_file():
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = f.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
         elif path == "/icon.svg":
             icon = find_icon_file()
             if icon is None:
@@ -3171,8 +3192,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _json(self, status, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         path = urlparse(self.path).path
+        if path in ("/api/ingest", "/api/ingest/delete"):
+            # Other machines' usage totals (device_ingest). Token-gated: the
+            # dashboard itself is open on the tailnet, writes are not.
+            if not device_ingest.authorized(self.headers.get("Authorization", "")):
+                return self._json(401, {"ok": False, "error": "missing or wrong ingest token"})
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = 0
+            if n <= 0 or n > INGEST_MAX_BYTES:
+                return self._json(413 if n > 0 else 400, {"ok": False, "error": "body must be 1 byte to %d MB" % (INGEST_MAX_BYTES // 2**20)})
+            try:
+                payload = json.loads(self.rfile.read(n).decode("utf-8"))
+                if path == "/api/ingest":
+                    result = device_ingest.ingest(DB_PATH, payload)
+                else:
+                    result = device_ingest.delete_device(DB_PATH, (payload or {}).get("device"))
+            except (ValueError, UnicodeDecodeError) as e:
+                return self._json(400, {"ok": False, "error": str(e)})
+            return self._json(200, result)
         if path == "/api/rescan":
             # Incremental scan: ingest new/changed JSONL without touching
             # existing rows. The DB is append-only and the only durable store
