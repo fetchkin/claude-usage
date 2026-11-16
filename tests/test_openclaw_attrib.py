@@ -368,6 +368,10 @@ class TestRangeAggregation(unittest.TestCase):
         self.assertEqual(self.chan_tokens(a) + self.chan_tokens(b), self.chan_tokens(both))
         # Daily totals add up to the range total, on Sydney days inside the range.
         self.assertEqual(sum(d["tokens"] for d in both["days"]), both["totals"]["tokens"])
+        # Hourly rows (by interface and model) add up to the same total.
+        self.assertEqual(sum(h["input"] + h["output"] + h["cache_read"] + h["cache_creation"]
+                             for h in both["hours"]), both["totals"]["tokens"])
+        self.assertTrue(all(h["interface"] in ("openclaw", "outside") for h in both["hours"]))
         self.assertEqual([d["date"] for d in both["days"]],
                          ["2026-10-27", "2026-10-28", "2026-10-29", "2026-11-02", "2026-11-03", "2026-11-04"])
 
