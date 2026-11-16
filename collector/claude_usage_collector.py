@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 VERSION = "1"
-DEFAULT_URL = "https://laptop-fevkm5fu.tailaecd9a.ts.net:8443/api/ingest"
+DEFAULT_URL = "https://tams-mac-mini.tailaecd9a.ts.net:8443/api/ingest"
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "fetchkin" / "usage-collector.env"
 
 

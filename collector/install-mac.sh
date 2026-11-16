@@ -2,7 +2,7 @@
 # Install the Claude usage collector on a Mac: pushes this Mac's Claude Code usage totals to the Fetchkin usage
 # dashboard every 10 minutes (launchd). One paste, from a Mac on the tailnet:
 #
-#   curl -fsSL https://laptop-fevkm5fu.tailaecd9a.ts.net:8443/collector/install-mac.sh | sh
+#   curl -fsSL https://tams-mac-mini.tailaecd9a.ts.net:8443/collector/install-mac.sh | sh
 #
 # Optional env: USAGE_INGEST_TOKEN (else you're asked for it, input hidden), USAGE_DEVICE_LABEL (default "Tam's Mac"),
 # USAGE_DEVICE (default this Mac's LocalHostName), USAGE_BASE (default the laptop's dashboard URL).
@@ -11,7 +11,7 @@
 #     ~/Library/LaunchAgents/com.fetchkin.claude-usage-collector.plist ~/.config/fetchkin/usage-collector.env
 set -eu
 
-BASE="${USAGE_BASE:-https://laptop-fevkm5fu.tailaecd9a.ts.net:8443}"
+BASE="${USAGE_BASE:-https://tams-mac-mini.tailaecd9a.ts.net:8443}"
 LABEL="${USAGE_DEVICE_LABEL:-Tam's Mac}"
 DEVICE="${USAGE_DEVICE:-$(scutil --get LocalHostName 2>/dev/null | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9._-')}"
 [ -n "$DEVICE" ] || DEVICE="mac"

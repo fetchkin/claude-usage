@@ -1,13 +1,13 @@
 # Install the Claude usage collector on a Windows machine: pushes its Claude Code usage totals to the Fetchkin usage
 # dashboard every 10 minutes (Task Scheduler, no window). From a machine on the tailnet, in PowerShell:
 #
-#   $f="$env:TEMP\install-cuc.ps1"; iwr https://laptop-fevkm5fu.tailaecd9a.ts.net:8443/collector/install-windows.ps1 -OutFile $f; & $f -Label "Office PC"
+#   $f="$env:TEMP\install-cuc.ps1"; iwr https://tams-mac-mini.tailaecd9a.ts.net:8443/collector/install-windows.ps1 -OutFile $f; & $f -Label "Office PC"
 #
 # Token: $env:USAGE_INGEST_TOKEN, else you're asked (input hidden). Uninstall: .\install-windows.ps1 -Uninstall
 param(
   [string]$Label = $env:COMPUTERNAME,
   [string]$Device = ($env:COMPUTERNAME.ToLower() -replace '[^a-z0-9._-]', ''),
-  [string]$Base = $(if ($env:USAGE_BASE) { $env:USAGE_BASE } else { 'https://laptop-fevkm5fu.tailaecd9a.ts.net:8443' }),
+  [string]$Base = $(if ($env:USAGE_BASE) { $env:USAGE_BASE } else { 'https://tams-mac-mini.tailaecd9a.ts.net:8443' }),
   [string]$Python = '',
   [switch]$Uninstall
 )
